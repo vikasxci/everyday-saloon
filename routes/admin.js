@@ -3,13 +3,14 @@ const jwt       = require('jsonwebtoken');
 const mongoose  = require('mongoose');
 const router    = express.Router();
 
-const AdminUser         = require('../models/AdminUser');
-const SubscriptionPlan  = require('../models/SubscriptionPlan');
-const AppConfig         = require('../models/AppConfig');
-const SaloonBusiness    = require('../models/SaloonBusiness');
-const SaloonStaff       = require('../models/SaloonStaff');
-const SaloonWorkEntry   = require('../models/SaloonWorkEntry');
-const adminAuth         = require('../middleware/adminAuth');
+const AdminUser              = require('../models/AdminUser');
+const SubscriptionPlan       = require('../models/SubscriptionPlan');
+const AppConfig              = require('../models/AppConfig');
+const SaloonBusiness         = require('../models/SaloonBusiness');
+const SaloonStaff            = require('../models/SaloonStaff');
+const SaloonWorkEntry        = require('../models/SaloonWorkEntry');
+const SaloonSalarySettlement = require('../models/SaloonSalarySettlement');
+const adminAuth              = require('../middleware/adminAuth');
 
 const ADMIN_SECRET = (process.env.JWT_SECRET || 'hadlay-kalan-secret-key') + '_admin';
 
@@ -77,10 +78,15 @@ router.get('/auth/me', adminAuth, (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 router.get('/dashboard', adminAuth, async (req, res) => {
   try {
-    const now = new Date();
+    const now          = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const endOfMonth   = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
 
-    const [total, trialCount, activeCount, expiredCount, suspendedCount,
-           recentSaloons, expiringSoon] = await Promise.all([
+    const [
+      total, trialCount, activeCount, expiredCount, suspendedCount,
+      recentSaloons, expiringSoon,
+      revenueAgg, salaryPaidAgg, mrrAgg, activeStaffCount
+    ] = await Promise.all([
       SaloonBusiness.countDocuments(),
       SaloonBusiness.countDocuments({ 'subscription.status': 'trial' }),
       SaloonBusiness.countDocuments({ 'subscription.status': 'active' }),
@@ -96,10 +102,46 @@ router.get('/dashboard', adminAuth, async (req, res) => {
         'subscription.trialEndsAt': { $gte: now, $lte: new Date(now.getTime() + 7 * 86400000) }
       })
         .select('businessName ownerName phone subscription.trialEndsAt')
-        .lean()
+        .lean(),
+      // Revenue & commissions this month across ALL saloons
+      SaloonWorkEntry.aggregate([
+        { $match: { serviceDate: { $gte: startOfMonth, $lte: endOfMonth } } },
+        { $group: {
+          _id: null,
+          revenue:       { $sum: '$grandTotal' },
+          staffEarnings: { $sum: '$staffEarning' },
+          bills:         { $sum: 1 }
+        }}
+      ]),
+      // Salary already settled this month
+      SaloonSalarySettlement.aggregate([
+        { $match: { settledAt: { $gte: startOfMonth, $lte: endOfMonth } } },
+        { $group: { _id: null, totalPaid: { $sum: '$amountPaid' } } }
+      ]),
+      // Platform MRR: sum of active saloon monthly rates
+      SaloonBusiness.aggregate([
+        { $match: { 'subscription.status': 'active' } },
+        { $group: { _id: null, mrr: { $sum: '$subscription.monthlyRate' } } }
+      ]),
+      SaloonStaff.countDocuments({ isActive: true })
     ]);
 
-    res.json({ total, trialCount, activeCount, expiredCount, suspendedCount, recentSaloons, expiringSoon });
+    const monthlyRevenue  = revenueAgg[0]?.revenue       || 0;
+    const staffEarnings   = revenueAgg[0]?.staffEarnings  || 0;
+    const billsThisMonth  = revenueAgg[0]?.bills          || 0;
+    const salaryPaid      = salaryPaidAgg[0]?.totalPaid   || 0;
+    const platformMRR     = mrrAgg[0]?.mrr                || 0;
+    const pendingSalary   = Math.max(0, staffEarnings - salaryPaid);
+    const grossProfit     = monthlyRevenue - staffEarnings;
+
+    res.json({
+      total, trialCount, activeCount, expiredCount, suspendedCount,
+      recentSaloons, expiringSoon,
+      // Revenue stats
+      monthlyRevenue, staffEarnings, salaryPaid, pendingSalary,
+      grossProfit, billsThisMonth, platformMRR, activeStaffCount,
+      month: now.toLocaleString('en-IN', { month: 'long', year: 'numeric' })
+    });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -271,6 +313,167 @@ router.patch('/config', adminAuth, async (req, res) => {
       { key: 'global' }, { $set: update }, { upsert: true, new: true }
     ).lean();
     res.json(cfg);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// SALARY REPORT
+// ═══════════════════════════════════════════════════════════════
+
+// GET /admin/salary-report — all saloons with salary summary for a period
+router.get('/salary-report', adminAuth, async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    const fromDate = from ? new Date(from) : new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    const toDate   = to   ? new Date(to)   : new Date();
+    toDate.setHours(23, 59, 59, 999);
+
+    const [saloons, earningsAgg, settledAgg] = await Promise.all([
+      SaloonBusiness.find({ isActive: true })
+        .select('businessName ownerName phone address.city subscription.status')
+        .sort({ businessName: 1 })
+        .lean(),
+      SaloonWorkEntry.aggregate([
+        { $match: { serviceDate: { $gte: fromDate, $lte: toDate } } },
+        { $group: {
+          _id: '$saloon',
+          totalRevenue:   { $sum: '$grandTotal' },
+          staffEarnings:  { $sum: '$staffEarning' },
+          totalBills:     { $sum: 1 }
+        }}
+      ]),
+      SaloonSalarySettlement.aggregate([
+        { $match: { settledAt: { $gte: fromDate, $lte: toDate } } },
+        { $group: { _id: '$saloon', totalPaid: { $sum: '$amountPaid' } } }
+      ])
+    ]);
+
+    const earningsMap = {};
+    earningsAgg.forEach(e => { earningsMap[e._id.toString()] = e; });
+    const settledMap = {};
+    settledAgg.forEach(s => { settledMap[s._id.toString()] = s.totalPaid; });
+
+    const result = saloons.map(s => {
+      const sid  = s._id.toString();
+      const e    = earningsMap[sid] || { totalRevenue: 0, staffEarnings: 0, totalBills: 0 };
+      const paid = settledMap[sid] || 0;
+      return {
+        ...s,
+        totalRevenue:  e.totalRevenue,
+        staffEarnings: e.staffEarnings,
+        totalBills:    e.totalBills,
+        salaryPaid:    paid,
+        pending:       Math.max(0, e.staffEarnings - paid)
+      };
+    });
+
+    res.json({ saloons: result, fromDate, toDate });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// GET /admin/salary-report/:saloonId — staff-level salary breakdown for a saloon
+router.get('/salary-report/:saloonId', adminAuth, async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    const saloonId = req.params.saloonId;
+    if (!mongoose.Types.ObjectId.isValid(saloonId))
+      return res.status(400).json({ message: 'Invalid saloon ID.' });
+
+    const fromDate = from ? new Date(from) : new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    const toDate   = to   ? new Date(to)   : new Date();
+    toDate.setHours(23, 59, 59, 999);
+
+    const sid = new mongoose.Types.ObjectId(saloonId);
+
+    const [saloon, staff, earningsAgg, settledAgg] = await Promise.all([
+      SaloonBusiness.findById(saloonId).select('businessName ownerName phone address.city').lean(),
+      SaloonStaff.find({ saloon: saloonId })
+        .select('name phone role salary commissionType commissionValue joiningDate isActive avatar')
+        .sort({ name: 1 })
+        .lean(),
+      SaloonWorkEntry.aggregate([
+        { $match: { saloon: sid, serviceDate: { $gte: fromDate, $lte: toDate } } },
+        { $group: {
+          _id: '$staff',
+          totalRevenue:  { $sum: '$grandTotal' },
+          staffEarnings: { $sum: '$staffEarning' },
+          totalBills:    { $sum: 1 }
+        }}
+      ]),
+      SaloonSalarySettlement.aggregate([
+        { $match: { saloon: sid, settledAt: { $gte: fromDate, $lte: toDate } } },
+        { $group: { _id: '$staff', totalPaid: { $sum: '$amountPaid' }, count: { $sum: 1 } } }
+      ])
+    ]);
+
+    if (!saloon) return res.status(404).json({ message: 'Saloon not found.' });
+
+    const earningsMap = {};
+    earningsAgg.forEach(e => { earningsMap[e._id.toString()] = e; });
+    const settledMap = {};
+    settledAgg.forEach(s => { settledMap[s._id.toString()] = s; });
+
+    const staffData = staff.map(s => {
+      const stid  = s._id.toString();
+      const e     = earningsMap[stid] || { totalRevenue: 0, staffEarnings: 0, totalBills: 0 };
+      const pData = settledMap[stid]  || { totalPaid: 0, count: 0 };
+      const pending = Math.max(0, e.staffEarnings - pData.totalPaid);
+      return {
+        ...s,
+        totalRevenue:    e.totalRevenue,
+        staffEarnings:   e.staffEarnings,
+        totalBills:      e.totalBills,
+        salaryPaid:      pData.totalPaid,
+        settlementsCount: pData.count,
+        pending
+      };
+    });
+
+    res.json({ saloon, staff: staffData, fromDate, toDate });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// GET /admin/salary-report/:saloonId/staff/:staffId/history
+router.get('/salary-report/:saloonId/staff/:staffId/history', adminAuth, async (req, res) => {
+  try {
+    const settlements = await SaloonSalarySettlement.find({
+      saloon: req.params.saloonId,
+      staff:  req.params.staffId
+    }).sort({ settledAt: -1 }).limit(30).lean();
+    res.json(settlements);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// POST /admin/salary-report/:saloonId/settle — record a salary payment
+router.post('/salary-report/:saloonId/settle', adminAuth, async (req, res) => {
+  try {
+    const { staffId, staffName, staffPhone, periodFrom, periodTo,
+            totalBills, totalRevenue, grossEarning, amountPaid, paymentMode, notes } = req.body;
+
+    if (!staffId || !periodFrom || !periodTo || amountPaid === undefined)
+      return res.status(400).json({ message: 'staffId, periodFrom, periodTo and amountPaid are required.' });
+
+    if (Number(amountPaid) < 0)
+      return res.status(400).json({ message: 'amountPaid cannot be negative.' });
+
+    const settlement = await SaloonSalarySettlement.create({
+      saloon:       req.params.saloonId,
+      staff:        staffId,
+      staffName:    staffName || '',
+      staffPhone:   staffPhone || '',
+      periodFrom:   new Date(periodFrom),
+      periodTo:     new Date(periodTo),
+      totalBills:   totalBills   || 0,
+      totalRevenue: totalRevenue || 0,
+      grossEarning: grossEarning || 0,
+      amountPaid:   Number(amountPaid),
+      paymentMode:  paymentMode || 'cash',
+      notes:        notes || '',
+      paidBy:       req.admin?.name || 'Admin',
+      settledAt:    new Date()
+    });
+
+    res.status(201).json(settlement);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
