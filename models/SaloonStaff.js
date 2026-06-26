@@ -68,3 +68,37 @@ saloonStaffSchema.methods.toSafeObject = function () {
 
 module.exports = mongoose.models.SaloonStaff ||
   mongoose.model('SaloonStaff', saloonStaffSchema);
+  token:       { type: String },
+  lastLoginAt: { type: Date },
+  loginCount:  { type: Number, default: 0 },
+  isActive:    { type: Boolean, default: true }
+
+}, { timestamps: true });
+
+saloonStaffSchema.index({ saloon: 1, role: 1 });
+saloonStaffSchema.index({ saloon: 1, phone: 1 }, { sparse: true });
+
+// Hooks
+saloonStaffSchema.pre('save', async function (next) {
+  if (this.isModified('password') && this.password)
+    this.password = await bcrypt.hash(this.password, 12);
+  if (this.isModified('pin') && this.pin)
+    this.pin = await bcrypt.hash(this.pin, 10);
+  next();
+});
+
+saloonStaffSchema.methods.comparePassword = function (plain) {
+  return bcrypt.compare(plain, this.password);
+};
+saloonStaffSchema.methods.comparePin = function (plain) {
+  return bcrypt.compare(plain, this.pin);
+};
+saloonStaffSchema.methods.toSafeObject = function () {
+  const obj = this.toObject();
+  delete obj.password;
+  delete obj.pin;
+  return obj;
+};
+
+module.exports = mongoose.models.SaloonStaff ||
+  mongoose.model('SaloonStaff', saloonStaffSchema);
