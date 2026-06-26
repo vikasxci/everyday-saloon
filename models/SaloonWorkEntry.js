@@ -62,3 +62,31 @@ saloonWorkEntrySchema.index({ saloon: 1, staff: 1, serviceDate: -1 });
 
 module.exports = mongoose.models.SaloonWorkEntry ||
   mongoose.model('SaloonWorkEntry', saloonWorkEntrySchema);
+
+  // Payment
+  paymentMode: {
+    type: String,
+    enum: ['cash', 'upi', 'card', 'wallet', 'credit'],
+    default: 'cash'
+  },
+  paymentStatus: {
+    type: String,
+    enum: ['paid', 'pending', 'partial'],
+    default: 'paid'
+  },
+  amountPaid:   { type: Number, default: 0 },
+  amountDue:    { type: Number, default: 0 },
+
+  // Notes
+  notes: { type: String, trim: true },
+
+  // Date
+  serviceDate: { type: Date, default: Date.now }
+
+}, { timestamps: true });
+
+saloonWorkEntrySchema.index({ saloon: 1, serviceDate: -1 });
+saloonWorkEntrySchema.index({ saloon: 1, staff: 1, serviceDate: -1 });
+
+module.exports = mongoose.models.SaloonWorkEntry ||
+  mongoose.model('SaloonWorkEntry', saloonWorkEntrySchema);
