@@ -51,3 +51,20 @@ businessActivityLogSchema.index({ createdAt: -1 });
 
 module.exports = mongoose.models.BusinessActivityLog ||
   mongoose.model('BusinessActivityLog', businessActivityLogSchema);
+
+  entity:     { type: String },   // 'bill', 'order', 'staff', 'service', etc.
+  entityId:   { type: Schema.Types.ObjectId },
+  entityName: { type: String },
+
+  details:   { type: Schema.Types.Mixed },
+  ip:        { type: String },
+  userAgent: { type: String },
+}, { timestamps: true });
+
+businessActivityLogSchema.index({ bizType: 1, createdAt: -1 });
+businessActivityLogSchema.index({ business: 1, createdAt: -1 });
+businessActivityLogSchema.index({ action: 1,   createdAt: -1 });
+businessActivityLogSchema.index({ createdAt: -1 });
+
+module.exports = mongoose.models.BusinessActivityLog ||
+  mongoose.model('BusinessActivityLog', businessActivityLogSchema);
