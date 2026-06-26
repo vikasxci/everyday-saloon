@@ -93,3 +93,62 @@ saloonAuth.requireRole = (...roles) => (req, res, next) => {
 };
 
 module.exports = saloonAuth;
+        message: cfg.serviceModeMessage || 'Service is under maintenance. Please try again shortly.'
+      });
+    }
+
+    // Per-saloon service mode
+    if (saloon.serviceMode) {
+      return res.status(503).json({
+        code: 'SERVICE_MODE',
+        message: 'This account is temporarily suspended for maintenance.'
+      });
+    }
+
+    // Subscription check
+    const sub = saloon.subscription || {};
+    const now = new Date();
+
+    if (sub.status === 'trial') {
+      if (sub.trialEndsAt && new Date(sub.trialEndsAt) < now) {
+        await SaloonBusiness.findByIdAndUpdate(saloonId, { 'subscription.status': 'expired' });
+        return res.status(402).json({
+          code: 'TRIAL_EXPIRED',
+          message: 'Your free trial has ended. Please subscribe to continue.',
+          trialEnded: true
+        });
+      }
+    } else if (sub.status === 'active') {
+      if (sub.currentPeriodEnd && new Date(sub.currentPeriodEnd) < now) {
+        await SaloonBusiness.findByIdAndUpdate(saloonId, { 'subscription.status': 'expired' });
+        return res.status(402).json({
+          code: 'SUBSCRIPTION_EXPIRED',
+          message: 'Your subscription has expired. Please renew to continue.'
+        });
+      }
+    } else if (sub.status === 'expired') {
+      return res.status(402).json({
+        code: 'SUBSCRIPTION_EXPIRED',
+        message: 'Your subscription has expired. Please contact the admin to renew.'
+      });
+    } else if (sub.status === 'suspended') {
+      return res.status(402).json({
+        code: 'ACCOUNT_SUSPENDED',
+        message: 'Your account has been suspended. Please contact support.'
+      });
+    }
+
+    next();
+  } catch {
+    res.status(401).json({ message: 'Invalid or expired token.' });
+  }
+};
+
+// ── Role guard factory ────────────────────────────────────────────────────────
+saloonAuth.requireRole = (...roles) => (req, res, next) => {
+  if (!roles.includes(req.staff.role))
+    return res.status(403).json({ message: `Access denied. Requires role: ${roles.join(' or ')}.` });
+  next();
+};
+
+module.exports = saloonAuth;
