@@ -6,6 +6,8 @@ const saloonBusinessSchema = new Schema({
   // Identity
   businessName: { type: String, required: true, trim: true },
   slug:         { type: String, unique: true, sparse: true },
+  // Short human-friendly ID staff type at login (e.g. "SLN4K7Q")
+  saloonCode:   { type: String, unique: true, sparse: true, uppercase: true, trim: true },
   ownerName:    { type: String, required: true, trim: true },
   email:        { type: String, required: true, lowercase: true, trim: true, unique: true },
   phone:        { type: String, required: true, trim: true, unique: true },
@@ -48,79 +50,7 @@ const saloonBusinessSchema = new Schema({
       enum: ['fixed', 'percent', 'none'],
       default: 'percent'
     },
-    commissionValue: { type: Number, default: 40 }, // e.g. 40%
-    taxPercent:      { type: Number, default: 0 },
-    appointmentSlotMinutes: { type: Number, default: 30 }
-  },
-
-  // Token for persistent login
-  token: { type: String },
-
-  // Shop GPS location (for staff attendance geofencing)
-  location: {
-    lat: { type: Number },
-    lng: { type: Number },
-    radius: { type: Number, default: 50 } // meters
-  },
-
-  isActive: { type: Boolean, default: true },
-
-  // ── Subscription ───────────────────────────────────────────
-  subscription: {
-    status: {
-      type: String,
-      enum: ['trial', 'active', 'expired', 'suspended'],
-      default: 'trial'
-    },
-    trialEndsAt:        { type: Date },
-    planId:             { type: mongoose.Schema.Types.ObjectId, ref: 'SubscriptionPlan' },
-    planName:           { type: String },
-    monthlyRate:        { type: Number, default: 0 },     // custom per-saloon rate
-    currentPeriodStart: { type: Date },
-    currentPeriodEnd:   { type: Date },
-    lastPaidAt:         { type: Date },
-    adminNotes:         { type: String }
-  },
-
-  // Per-saloon maintenance/service mode
-  serviceMode: { type: Boolean, default: false }
-
-}, { timestamps: true });
-
-// Hash password
-saloonBusinessSchema.pre('save', async function (next) {
-  if (!this.isModified('password')) return next();
-  this.password = await bcrypt.hash(this.password, 12);
-  next();
-});
-
-saloonBusinessSchema.methods.comparePassword = function (plain) {
-  return bcrypt.compare(plain, this.password);
-};
-
-saloonBusinessSchema.methods.toSafeObject = function () {
-  const obj = this.toObject();
-  delete obj.password;
-  return obj;
-};
-
-module.exports = mongoose.models.SaloonBusiness ||
-  mongoose.model('SaloonBusiness', saloonBusinessSchema);
-    }, { _id: false }),
-    default: {}
-  },
-
-  // Settings
-  settings: {
-    currency:       { type: String, default: 'INR' },
-    currencySymbol: { type: String, default: '₹' },
-    timezone:       { type: String, default: 'Asia/Kolkata' },
-    commissionType: {
-      type: String,
-      enum: ['fixed', 'percent', 'none'],
-      default: 'percent'
-    },
-    commissionValue: { type: Number, default: 40 }, // e.g. 40%
+    commissionValue: { type: Number, default: 50 }, // e.g. 50%
     taxPercent:      { type: Number, default: 0 },
     appointmentSlotMinutes: { type: Number, default: 30 }
   },
