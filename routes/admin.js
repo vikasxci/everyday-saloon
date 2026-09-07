@@ -10,18 +10,62 @@ const SaloonBusiness         = require('../models/SaloonBusiness');
 const SaloonStaff            = require('../models/SaloonStaff');
 const SaloonWorkEntry        = require('../models/SaloonWorkEntry');
 const SaloonSalarySettlement = require('../models/SaloonSalarySettlement');
+const SaloonService          = require('../models/SaloonService');
+const SaloonCustomer         = require('../models/SaloonCustomer');
+const SaloonAttendance       = require('../models/SaloonAttendance');
+const SaloonCollectionRequest = require('../models/SaloonCollectionRequest');
+const BusinessActivityLog    = require('../models/BusinessActivityLog');
 const adminAuth              = require('../middleware/adminAuth');
 
 const ADMIN_SECRET = (process.env.JWT_SECRET || 'hadlay-kalan-secret-key') + '_admin';
 
-// ── Helper ───────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────
 function makeAdminToken(id) {
   return jwt.sign({ id }, ADMIN_SECRET, { expiresIn: '7d' });
+}
+
+// Anything that changes an account, deletes data, or touches other admins
+// is superadmin-only. 'support' keeps read access plus subscription edits.
+function requireSuper(req, res, next) {
+  if (req.admin?.role !== 'superadmin')
+    return res.status(403).json({ message: 'Superadmin access required for this action.' });
+  next();
+}
+
+// Record an admin action against the saloon's own activity trail
+async function logAdmin(req, saloon, action, extras = {}) {
+  try {
+    await BusinessActivityLog.create({
+      bizType: 'saloon',
+      business: saloon._id,
+      businessName: saloon.businessName,
+      ownerEmail: saloon.email,
+      actor: `${req.admin.name} (admin)`,
+      actorRole: req.admin.role,
+      action,
+      entity: extras.entity || 'saloon',
+      entityId: extras.entityId || saloon._id,
+      entityName: extras.entityName || saloon.businessName,
+      details: extras.details || null,
+      ip: req.headers['x-forwarded-for']?.split(',')[0] || req.socket?.remoteAddress || '',
+      userAgent: req.headers['user-agent'] || ''
+    });
+  } catch (err) {
+    console.warn(`⚠️  admin activity log skipped (${action}):`, err.message);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
 // SETUP — create first admin (only if none exists)
 // ═══════════════════════════════════════════════════════════════
+// Public: lets the panel show a first-run setup form instead of a dead login box
+router.get('/setup-status', async (req, res) => {
+  try {
+    const count = await AdminUser.countDocuments();
+    res.json({ needsSetup: count === 0 });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 router.post('/setup', async (req, res) => {
   try {
     const count = await AdminUser.countDocuments();
@@ -31,6 +75,8 @@ router.post('/setup', async (req, res) => {
     const { name, username, password } = req.body;
     if (!name || !username || !password)
       return res.status(400).json({ message: 'name, username and password are required.' });
+    if (String(password).length < 8)
+      return res.status(400).json({ message: 'Choose a password of at least 8 characters.' });
 
     const admin = await AdminUser.create({ name, username, password, role: 'superadmin' });
 
@@ -71,6 +117,128 @@ router.post('/auth/login', async (req, res) => {
 
 router.get('/auth/me', adminAuth, (req, res) => {
   res.json(req.admin);
+});
+
+// Change your own password
+router.post('/auth/change-password', adminAuth, async (req, res) => {
+  try {
+    const { oldPassword, newPassword } = req.body;
+    if (!oldPassword || !newPassword)
+      return res.status(400).json({ message: 'Current and new password are required.' });
+    if (String(newPassword).length < 6)
+      return res.status(400).json({ message: 'Password must be at least 6 characters.' });
+
+    const admin = await AdminUser.findById(req.admin._id);
+    if (!admin) return res.status(404).json({ message: 'Admin not found.' });
+    if (!await admin.comparePassword(oldPassword))
+      return res.status(401).json({ message: 'Current password is incorrect.' });
+
+    admin.password = newPassword;
+    await admin.save();
+    res.json({ message: 'Password changed.' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ADMIN USERS  (superadmin only)
+// ═══════════════════════════════════════════════════════════════
+router.get('/admins', adminAuth, requireSuper, async (req, res) => {
+  try {
+    const list = await AdminUser.find().select('-password').sort({ createdAt: 1 }).lean();
+    res.json(list.map(a => ({ ...a, isSelf: String(a._id) === String(req.admin._id) })));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+router.post('/admins', adminAuth, requireSuper, async (req, res) => {
+  try {
+    const { name, username, password, role } = req.body;
+    if (!name || !username || !password)
+      return res.status(400).json({ message: 'Name, username and password are required.' });
+    if (String(password).length < 6)
+      return res.status(400).json({ message: 'Password must be at least 6 characters.' });
+    if (role && !['superadmin', 'support'].includes(role))
+      return res.status(400).json({ message: 'Role must be superadmin or support.' });
+
+    const exists = await AdminUser.findOne({ username: String(username).toLowerCase().trim() });
+    if (exists) return res.status(409).json({ message: 'That username is already taken.' });
+
+    const admin = await AdminUser.create({
+      name: name.trim(), username: String(username).toLowerCase().trim(),
+      password, role: role || 'support'
+    });
+    const { password: _, ...safe } = admin.toObject();
+    res.status(201).json(safe);
+  } catch (err) {
+    if (err.code === 11000) return res.status(409).json({ message: 'That username is already taken.' });
+    res.status(500).json({ message: err.message });
+  }
+});
+
+router.patch('/admins/:id', adminAuth, requireSuper, async (req, res) => {
+  try {
+    const { name, role, isActive } = req.body;
+    const admin = await AdminUser.findById(req.params.id);
+    if (!admin) return res.status(404).json({ message: 'Admin not found.' });
+
+    const isSelf = String(admin._id) === String(req.admin._id);
+    if (isSelf && (isActive === false || (role && role !== 'superadmin')))
+      return res.status(400).json({ message: 'You cannot demote or deactivate your own account.' });
+
+    // Never leave the platform without a way in
+    const losingSuper = admin.role === 'superadmin' &&
+      ((role && role !== 'superadmin') || isActive === false);
+    if (losingSuper) {
+      const others = await AdminUser.countDocuments({
+        _id: { $ne: admin._id }, role: 'superadmin', isActive: true
+      });
+      if (others === 0)
+        return res.status(400).json({ message: 'This is the last active superadmin — promote another one first.' });
+    }
+
+    if (name !== undefined)     admin.name = name.trim();
+    if (role !== undefined)     admin.role = role;
+    if (isActive !== undefined) admin.isActive = !!isActive;
+    await admin.save();
+
+    const { password: _, ...safe } = admin.toObject();
+    res.json(safe);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Reset another admin's password
+router.post('/admins/:id/password', adminAuth, requireSuper, async (req, res) => {
+  try {
+    const { password } = req.body;
+    if (!password || String(password).length < 6)
+      return res.status(400).json({ message: 'Password must be at least 6 characters.' });
+
+    const admin = await AdminUser.findById(req.params.id);
+    if (!admin) return res.status(404).json({ message: 'Admin not found.' });
+
+    admin.password = password;
+    await admin.save();
+    res.json({ message: `Password reset for ${admin.username}.` });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+router.delete('/admins/:id', adminAuth, requireSuper, async (req, res) => {
+  try {
+    const admin = await AdminUser.findById(req.params.id);
+    if (!admin) return res.status(404).json({ message: 'Admin not found.' });
+    if (String(admin._id) === String(req.admin._id))
+      return res.status(400).json({ message: 'You cannot delete your own account.' });
+
+    if (admin.role === 'superadmin') {
+      const others = await AdminUser.countDocuments({
+        _id: { $ne: admin._id }, role: 'superadmin', isActive: true
+      });
+      if (others === 0)
+        return res.status(400).json({ message: 'This is the last active superadmin — promote another one first.' });
+    }
+
+    await AdminUser.findByIdAndDelete(admin._id);
+    res.json({ message: `Removed ${admin.username}.` });
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -158,7 +326,8 @@ router.get('/saloons', adminAuth, async (req, res) => {
         { businessName: { $regex: search, $options: 'i' } },
         { ownerName:    { $regex: search, $options: 'i' } },
         { phone:        { $regex: search, $options: 'i' } },
-        { email:        { $regex: search, $options: 'i' } }
+        { email:        { $regex: search, $options: 'i' } },
+        { saloonCode:   { $regex: search, $options: 'i' } }
       ];
     }
 
@@ -215,6 +384,7 @@ router.patch('/saloons/:id/subscription', adminAuth, async (req, res) => {
     ).select('-password -token').lean();
 
     if (!saloon) return res.status(404).json({ message: 'Saloon not found.' });
+    logAdmin(req, saloon, 'admin_subscription_update', { details: update });
     res.json(saloon);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -227,9 +397,221 @@ router.patch('/saloons/:id/service-mode', adminAuth, async (req, res) => {
       req.params.id,
       { $set: { serviceMode: !!serviceMode } },
       { new: true }
-    ).select('businessName serviceMode').lean();
+    ).select('businessName email serviceMode').lean();
     if (!saloon) return res.status(404).json({ message: 'Saloon not found.' });
+    logAdmin(req, saloon, 'admin_service_mode', { details: { serviceMode: !!serviceMode } });
     res.json(saloon);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── Saloon detail tabs ───────────────────────────────────────
+
+// Staff roster with per-staff earnings
+router.get('/saloons/:id/staff', adminAuth, async (req, res) => {
+  try {
+    const saloonId = new mongoose.Types.ObjectId(req.params.id);
+    const [staff, earnings, paid] = await Promise.all([
+      SaloonStaff.find({ saloon: saloonId })
+        .select('name phone email role designation salary commissionType commissionValue joiningDate isActive avatar lastLoginAt loginCount')
+        .sort({ createdAt: 1 }).lean(),
+      SaloonWorkEntry.aggregate([
+        { $match: { saloon: saloonId } },
+        { $group: { _id: '$staff', bills: { $sum: 1 }, revenue: { $sum: '$grandTotal' }, earned: { $sum: '$staffEarning' } } }
+      ]),
+      SaloonSalarySettlement.aggregate([
+        { $match: { saloon: saloonId } },
+        { $group: { _id: '$staff', paid: { $sum: '$amountPaid' } } }
+      ])
+    ]);
+
+    const eMap = Object.fromEntries(earnings.map(e => [String(e._id), e]));
+    const pMap = Object.fromEntries(paid.map(p => [String(p._id), p.paid]));
+
+    res.json(staff.map(st => {
+      const e = eMap[String(st._id)] || { bills: 0, revenue: 0, earned: 0 };
+      const totalPaid = pMap[String(st._id)] || 0;
+      return { ...st, bills: e.bills, revenue: e.revenue, earned: e.earned,
+               paid: totalPaid, pending: Math.max(0, e.earned - totalPaid) };
+    }));
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Recent bills
+router.get('/saloons/:id/bills', adminAuth, async (req, res) => {
+  try {
+    const { page = 1, limit = 20 } = req.query;
+    const q = { saloon: req.params.id };
+    const [bills, total] = await Promise.all([
+      SaloonWorkEntry.find(q).sort({ serviceDate: -1, createdAt: -1 })
+        .skip((page - 1) * limit).limit(Number(limit))
+        .select('billNumber customerName staffName grandTotal amountPaid amountDue paymentStatus paymentMode serviceDate staffEarning')
+        .lean(),
+      SaloonWorkEntry.countDocuments(q)
+    ]);
+    res.json({ bills, total, page: Number(page), pages: Math.ceil(total / limit) });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Activity for one saloon
+router.get('/saloons/:id/activity', adminAuth, async (req, res) => {
+  try {
+    const { page = 1, limit = 30, action = '' } = req.query;
+    const q = { business: req.params.id };
+    if (action) q.action = action;
+    const [logs, total] = await Promise.all([
+      BusinessActivityLog.find(q).sort({ createdAt: -1 })
+        .skip((page - 1) * limit).limit(Number(limit)).lean(),
+      BusinessActivityLog.countDocuments(q)
+    ]);
+    res.json({ logs, total, page: Number(page), pages: Math.ceil(total / limit) });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── Saloon account commands (superadmin) ─────────────────────
+
+// Edit business details
+router.patch('/saloons/:id', adminAuth, requireSuper, async (req, res) => {
+  try {
+    const { businessName, ownerName, email, phone, city, businessType, gstin } = req.body;
+    const saloon = await SaloonBusiness.findById(req.params.id);
+    if (!saloon) return res.status(404).json({ message: 'Saloon not found.' });
+
+    if (email && email.toLowerCase().trim() !== saloon.email) {
+      const clash = await SaloonBusiness.findOne({ email: email.toLowerCase().trim(), _id: { $ne: saloon._id } });
+      if (clash) return res.status(409).json({ message: 'Another saloon already uses that email.' });
+      saloon.email = email.toLowerCase().trim();
+    }
+    if (phone && phone.trim() !== saloon.phone) {
+      const clash = await SaloonBusiness.findOne({ phone: phone.trim(), _id: { $ne: saloon._id } });
+      if (clash) return res.status(409).json({ message: 'Another saloon already uses that phone.' });
+      saloon.phone = phone.trim();
+    }
+    if (businessName) saloon.businessName = businessName.trim();
+    if (ownerName)    saloon.ownerName    = ownerName.trim();
+    if (businessType) saloon.businessType = businessType;
+    if (gstin !== undefined) saloon.gstin = gstin;
+    if (city !== undefined)  saloon.address = { ...(saloon.address || {}), city };
+
+    await saloon.save();
+    logAdmin(req, saloon, 'admin_saloon_update', { details: { by: req.admin.username } });
+
+    const { password: _, token: __, ...safe } = saloon.toObject();
+    res.json(safe);
+  } catch (err) {
+    if (err.code === 11000) return res.status(409).json({ message: 'Email or phone already in use.' });
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Activate / deactivate the whole account
+router.patch('/saloons/:id/status', adminAuth, requireSuper, async (req, res) => {
+  try {
+    const { isActive } = req.body;
+    const saloon = await SaloonBusiness.findByIdAndUpdate(
+      req.params.id, { $set: { isActive: !!isActive } }, { new: true }
+    ).select('-password -token');
+    if (!saloon) return res.status(404).json({ message: 'Saloon not found.' });
+
+    // Deactivating logs everyone out
+    if (!isActive) await SaloonStaff.updateMany({ saloon: saloon._id }, { $unset: { token: 1 } });
+
+    logAdmin(req, saloon, 'admin_saloon_status', { details: { isActive: !!isActive } });
+    res.json({ _id: saloon._id, businessName: saloon.businessName, isActive: saloon.isActive });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Reset the owner's login password (support requests)
+router.post('/saloons/:id/owner-password', adminAuth, requireSuper, async (req, res) => {
+  try {
+    const { password } = req.body;
+    if (!password || String(password).length < 6)
+      return res.status(400).json({ message: 'Password must be at least 6 characters.' });
+
+    const saloon = await SaloonBusiness.findById(req.params.id);
+    if (!saloon) return res.status(404).json({ message: 'Saloon not found.' });
+
+    // The owner logs in through their SaloonStaff record; keep the business
+    // record in step so both credentials stay consistent.
+    const owner = await SaloonStaff.findOne({ saloon: saloon._id, role: 'owner' });
+    if (!owner) return res.status(404).json({ message: 'Owner account not found for this saloon.' });
+
+    owner.password = password;
+    owner.token = undefined;
+    await owner.save();
+
+    saloon.password = password;
+    await saloon.save();
+
+    logAdmin(req, saloon, 'admin_owner_password_reset', {
+      entity: 'staff', entityId: owner._id, entityName: owner.name
+    });
+    res.json({ message: `Owner password reset for ${saloon.businessName}.`, ownerName: owner.name, loginWith: owner.phone || owner.email });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// Delete a saloon and everything under it
+router.delete('/saloons/:id', adminAuth, requireSuper, async (req, res) => {
+  try {
+    const saloon = await SaloonBusiness.findById(req.params.id);
+    if (!saloon) return res.status(404).json({ message: 'Saloon not found.' });
+
+    // Typing the exact business name is the confirmation
+    if (String(req.body?.confirmName || '').trim() !== saloon.businessName)
+      return res.status(400).json({ message: `Type the exact business name "${saloon.businessName}" to confirm deletion.` });
+
+    const id = saloon._id;
+    const [staff, services, entries, customers, attendance, settlements, requests] = await Promise.all([
+      SaloonStaff.deleteMany({ saloon: id }),
+      SaloonService.deleteMany({ saloon: id }),
+      SaloonWorkEntry.deleteMany({ saloon: id }),
+      SaloonCustomer.deleteMany({ saloon: id }),
+      SaloonAttendance.deleteMany({ saloon: id }),
+      SaloonSalarySettlement.deleteMany({ saloon: id }),
+      SaloonCollectionRequest.deleteMany({ saloon: id })
+    ]);
+    await BusinessActivityLog.deleteMany({ business: id });
+    await SaloonBusiness.findByIdAndDelete(id);
+
+    console.warn(`🗑️  Admin ${req.admin.username} deleted saloon "${saloon.businessName}" (${id})`);
+    res.json({
+      message: `Deleted "${saloon.businessName}" and all of its data.`,
+      removed: {
+        staff: staff.deletedCount, services: services.deletedCount,
+        bills: entries.deletedCount, customers: customers.deletedCount,
+        attendance: attendance.deletedCount, settlements: settlements.deletedCount,
+        collectionRequests: requests.deletedCount
+      }
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ACTIVITY LOG  (platform-wide)
+// ═══════════════════════════════════════════════════════════════
+router.get('/activity', adminAuth, async (req, res) => {
+  try {
+    const { page = 1, limit = 40, action = '', search = '', from = '', to = '' } = req.query;
+    const q = { bizType: 'saloon' };
+    if (action) q.action = action;
+    if (search) q.$or = [
+      { businessName: { $regex: search, $options: 'i' } },
+      { actor:        { $regex: search, $options: 'i' } },
+      { entityName:   { $regex: search, $options: 'i' } }
+    ];
+    if (from || to) {
+      q.createdAt = {};
+      if (from) q.createdAt.$gte = new Date(from);
+      if (to)   q.createdAt.$lte = new Date(new Date(to).setHours(23, 59, 59, 999));
+    }
+
+    const [logs, total, actions] = await Promise.all([
+      BusinessActivityLog.find(q).sort({ createdAt: -1 })
+        .skip((page - 1) * limit).limit(Number(limit)).lean(),
+      BusinessActivityLog.countDocuments(q),
+      BusinessActivityLog.distinct('action', { bizType: 'saloon' })
+    ]);
+
+    res.json({ logs, total, page: Number(page), pages: Math.ceil(total / limit), actions: actions.sort() });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
@@ -243,7 +625,7 @@ router.get('/plans', adminAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-router.post('/plans', adminAuth, async (req, res) => {
+router.post('/plans', adminAuth, requireSuper, async (req, res) => {
   try {
     const { name, description, period, price, originalPrice, discountLabel, features, isDefault, sortOrder } = req.body;
     if (!name || !period || price === undefined)
@@ -263,7 +645,7 @@ router.post('/plans', adminAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-router.put('/plans/:id', adminAuth, async (req, res) => {
+router.put('/plans/:id', adminAuth, requireSuper, async (req, res) => {
   try {
     const { isDefault, period } = req.body;
 
@@ -281,7 +663,7 @@ router.put('/plans/:id', adminAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-router.delete('/plans/:id', adminAuth, async (req, res) => {
+router.delete('/plans/:id', adminAuth, requireSuper, async (req, res) => {
   try {
     await SubscriptionPlan.findByIdAndDelete(req.params.id);
     res.json({ message: 'Plan deleted.' });
@@ -302,7 +684,7 @@ router.get('/config', adminAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-router.patch('/config', adminAuth, async (req, res) => {
+router.patch('/config', adminAuth, requireSuper, async (req, res) => {
   try {
     const allowed = ['globalServiceMode', 'serviceModeMessage', 'defaultTrialDays', 'defaultMonthlyRate'];
     const update  = {};
