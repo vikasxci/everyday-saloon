@@ -37,6 +37,7 @@ const businessActivityLogSchema = new Schema({
       // Admin actions
       'admin_saloon_update', 'admin_saloon_status', 'admin_owner_password_reset',
       'admin_subscription_update', 'admin_service_mode', 'admin_saloon_delete',
+      'account_delete',
       // Operations
       'table_status',
       'attendance_mark',
