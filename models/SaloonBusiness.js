@@ -103,6 +103,7 @@ saloonBusinessSchema.methods.comparePassword = function (plain) {
 saloonBusinessSchema.methods.toSafeObject = function () {
   const obj = this.toObject();
   delete obj.password;
+  delete obj.token;
   return obj;
 };
 
