@@ -37,9 +37,12 @@ const saloonStaffSchema = new Schema({
   resetOtp:          { type: String },
   resetOtpExpiresAt: { type: Date },
   resetRequestedAt:  { type: Date },
+  resetOtpAttempts:  { type: Number, default: 0 },
 
-  // Session
+  // Sessions — one token per signed-in device (newest MAX kept). `token` is the
+  // pre-multi-device field, still honoured so existing logins keep working.
   token:       { type: String },
+  tokens:      { type: [String], default: undefined },
   lastLoginAt: { type: Date },
   loginCount:  { type: Number, default: 0 },
   isActive:    { type: Boolean, default: true }
@@ -70,6 +73,9 @@ saloonStaffSchema.methods.toSafeObject = function () {
   delete obj.pin;
   delete obj.resetOtp;
   delete obj.resetOtpExpiresAt;
+  delete obj.resetOtpAttempts;
+  delete obj.token;
+  delete obj.tokens;
   return obj;
 };
 
