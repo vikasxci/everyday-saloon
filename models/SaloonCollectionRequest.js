@@ -5,7 +5,8 @@ const collectionRequestSchema = new mongoose.Schema({
   customer:     { type: mongoose.Schema.Types.ObjectId, ref: 'SaloonCustomer', required: true },
   customerName: { type: String, default: '' },
   customerPhone:{ type: String, default: '' },
-  amount:       { type: Number, required: true },
+  amount:       { type: Number, required: true },   // actually collected once approved
+  requestedAmount: { type: Number },                 // what the staff member submitted
   paymentMode:  { type: String, enum: ['cash','upi','card','wallet'], default: 'cash' },
   notes:        { type: String, default: '' },
 
