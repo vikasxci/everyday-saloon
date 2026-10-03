@@ -1,6 +1,7 @@
 const express = require('express');
 const router  = express.Router();
 const jwt     = require('jsonwebtoken');
+const crypto  = require('crypto');
 const mongoose = require('mongoose');
 const multer  = require('multer');
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
@@ -8,6 +9,12 @@ const cloudinary = require('cloudinary').v2;
 
 const saloonAuth = require('../middleware/saloonAuth');
 const { requireRole } = saloonAuth;
+const { rateLimit, byIdentifier } = require('../middleware/rateLimit');
+const { JWT_SECRET } = require('../config/secrets');
+const { sendError, isId, escapeRegex, pageParams, toNum, isEmail, MIN_PASSWORD, weakPassword } = require('../utils/http');
+const { normPhone, isPhone, phoneVariants } = require('../utils/phone');
+const { safeTz, todayRange, monthRange, parseDay, dateKey, hhmm } = require('../utils/time');
+const { deleteSaloonData } = require('../utils/saloonData');
 
 const SaloonBusiness   = require('../models/SaloonBusiness');
 const SaloonStaff      = require('../models/SaloonStaff');
@@ -18,8 +25,34 @@ const SaloonAttendance = require('../models/SaloonAttendance');
 const SaloonSalarySettlement = require('../models/SaloonSalarySettlement');
 const BusinessActivityLog = require('../models/BusinessActivityLog');
 const SaloonCollectionRequest = require('../models/SaloonCollectionRequest');
+const AppConfig        = require('../models/AppConfig');
+const Counter          = require('../models/Counter');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'hadlay-kalan-secret-key';
+const oid = v => new mongoose.Types.ObjectId(String(v));
+const MANAGERS = ['owner', 'manager'];
+const isManager = staff => MANAGERS.includes(staff?.role);
+const tzOf = saloon => safeTz(saloon?.settings?.timezone);
+const pwMsg = `Password must be at least ${MIN_PASSWORD} characters.`;
+
+// Money taken in (bills, collections, salary) is Cash or UPI only, always chosen explicitly.
+// Older records may still hold card/wallet/bank/other; the schemas keep those values valid.
+const PAY_MODES = ['cash', 'upi'];
+const payModeOf = v => { const m = String(v || '').trim().toLowerCase(); return PAY_MODES.includes(m) ? m : null; };
+const PAY_MODE_MSG = 'Select a payment mode: Cash or UPI.';
+
+// ── Rate limits ───────────────────────────────────────────────────────────────
+const MIN15 = 15 * 60 * 1000;
+const authIpLimit    = rateLimit({ windowMs: MIN15, max: 300 });
+const loginLimit     = rateLimit({ windowMs: MIN15, max: 10, failuresOnly: true,
+  key: byIdentifier('identifier', 'emailOrPhone', 'phone'),
+  message: 'Too many failed attempts for this account. Please wait 15 minutes or use "Forgot password".' });
+const pinLimit       = rateLimit({ windowMs: MIN15, max: 10, failuresOnly: true });
+const forgotLimit    = rateLimit({ windowMs: MIN15, max: 5, key: byIdentifier('identifier', 'phone'),
+  message: 'Too many reset requests. Please wait 15 minutes.' });
+const otpLimit       = rateLimit({ windowMs: MIN15, max: 20, failuresOnly: true });
+const registerLimit  = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, successOnly: true,
+  message: 'Too many registrations from this network. Please try again later.' });
+const passwordLimit  = rateLimit({ windowMs: MIN15, max: 10, failuresOnly: true });
 
 // ── Activity Logger ───────────────────────────────────────────────────────────
 async function logActivity(req, saloon, action, extras = {}) {
@@ -36,7 +69,7 @@ async function logActivity(req, saloon, action, extras = {}) {
       entityId:   extras.entityId   || null,
       entityName: extras.entityName || null,
       details:    extras.details    || null,
-      ip:         req.headers['x-forwarded-for']?.split(',')[0] || req.socket?.remoteAddress || '',
+      ip:         req.ip || '',
       userAgent:  req.headers['user-agent'] || '',
     });
   } catch (err) {
@@ -50,23 +83,36 @@ async function logActivity(req, saloon, action, extras = {}) {
 const photoStorage = new CloudinaryStorage({
   cloudinary,
   params: {
-    folder: 'hadlay-kalan/saloon',
+    folder: 'everyday-saloon/saloon',
     allowed_formats: ['jpg', 'jpeg', 'png', 'webp'],
     transformation: [{ width: 800, height: 800, crop: 'limit', quality: 'auto' }]
   }
 });
 const uploadPhoto = multer({ storage: photoStorage, limits: { fileSize: 5 * 1024 * 1024 } });
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-// 10 years — staff/owner stay logged in until they explicitly log out
-function makeToken(staffId, saloonId, role) {
-  return jwt.sign({ staffId, saloonId, role }, JWT_SECRET, { expiresIn: '3650d' });
+// ── Sessions ──────────────────────────────────────────────────────────────────
+// 10 years — staff/owner stay logged in until they explicitly log out.
+// Each device gets its own token; the newest MAX_SESSIONS are kept.
+const MAX_SESSIONS = 5;
+function issueToken(staff) {
+  // jwtid makes every token unique — two logins in the same second would otherwise be identical
+  const token = jwt.sign({ staffId: staff._id, saloonId: staff.saloon, role: staff.role }, JWT_SECRET,
+    { expiresIn: '3650d', jwtid: crypto.randomBytes(9).toString('base64url') });
+  staff.tokens = [...(staff.tokens || []), token].slice(-MAX_SESSIONS);
+  return token;
 }
-function slugify(t) {
-  return t.toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-').substring(0, 50);
+// Signs a staff member out everywhere (password reset, deactivation …), optionally keeping one token
+function revokeSessions(staffId, keepToken) {
+  return SaloonStaff.updateOne({ _id: staffId }, {
+    $unset: { token: 1 }, $set: { tokens: keepToken ? [keepToken] : [] }
+  });
 }
 
-// ── Saloon code (short, human friendly ID staff type at login) ────────────────
+function slugify(t) {
+  return t.toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-').substring(0, 50) || 'saloon';
+}
+
+// ── Saloon code (short, human friendly ID) ────────────────────────────────────
 // Avoids look-alike characters (0/O, 1/I/L) so it can be read out over a phone.
 const CODE_ALPHABET = 'ACDEFGHJKMNPQRTUVWXY2346789';
 function randomCode(len = 6) {
@@ -96,42 +142,131 @@ async function resolveSaloon(idOrCode) {
   const key = String(idOrCode || '').trim();
   if (!key) return null;
   let biz = await SaloonBusiness.findOne({ saloonCode: key.toUpperCase() });
-  if (!biz && mongoose.Types.ObjectId.isValid(key)) biz = await SaloonBusiness.findById(key);
+  if (!biz && isId(key)) biz = await SaloonBusiness.findById(key);
   if (!biz) biz = await SaloonBusiness.findOne({ slug: key.toLowerCase() });
   return biz;
 }
 function makeOtp() {
-  return String(Math.floor(100000 + Math.random() * 900000));
+  return String(crypto.randomInt(100000, 1000000));
 }
 const OTP_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const OTP_MAX_ATTEMPTS = 5;
+
+// Bill numbers come from an atomic per-saloon counter (countDocuments()+1 handed
+// out duplicates under concurrent saves). Seeded from existing bills the first time.
 async function nextBillNumber(saloonId) {
-  const n = await SaloonWorkEntry.countDocuments({ saloon: saloonId });
-  return `SAL-${String(n + 1).padStart(5, '0')}`;
+  const key = `bill:${saloonId}`;
+  if (!await Counter.exists({ key })) {
+    const [count, last] = await Promise.all([
+      SaloonWorkEntry.countDocuments({ saloon: saloonId }),
+      SaloonWorkEntry.findOne({ saloon: saloonId }).sort({ createdAt: -1 }).select('billNumber').lean()
+    ]);
+    const lastN = parseInt(String(last?.billNumber || '').replace(/\D/g, ''), 10) || 0;
+    try {
+      await Counter.updateOne({ key }, { $max: { seq: Math.max(count, lastN) } }, { upsert: true });
+    } catch (err) { if (err.code !== 11000) throw err; }
+  }
+  const c = await Counter.findOneAndUpdate({ key }, { $inc: { seq: 1 } }, { new: true });
+  return `SAL-${String(c.seq).padStart(5, '0')}`;
 }
 async function nextCustomerName(saloonId) {
   const n = await SaloonCustomer.countDocuments({ saloon: saloonId });
   return `Customer-${n + 1}`;
 }
 
+// The live outstanding balance — customer.pendingAmount is a cache of this.
+async function livePending(saloonId, customerId, staffId) {
+  const match = { saloon: saloonId, customer: customerId, paymentStatus: { $in: ['pending', 'partial'] }, amountDue: { $gt: 0 } };
+  if (staffId) match.staff = staffId;
+  const [agg] = await SaloonWorkEntry.aggregate([{ $match: match }, { $group: { _id: null, total: { $sum: '$amountDue' } } }]);
+  return agg?.total || 0;
+}
+async function syncCustomerPending(saloonId, customerId) {
+  const total = await livePending(saloonId, customerId);
+  await SaloonCustomer.updateOne({ _id: customerId }, { $set: { pendingAmount: total } });
+  return total;
+}
+
+// Applies a payment to a customer's open bills, oldest first. A bill that becomes
+// fully paid credits the staff commission that was computed (at their own rate)
+// when the bill was created. Returns the amount actually applied.
+async function applyPayment({ saloonId, customerId, amount, staffScope, creditStaffId }) {
+  const q = { saloon: saloonId, customer: customerId, paymentStatus: { $in: ['pending', 'partial'] }, amountDue: { $gt: 0 } };
+  if (staffScope) q.staff = staffScope;
+  const bills = await SaloonWorkEntry.find(q).sort({ serviceDate: 1, createdAt: 1 });
+
+  let remaining = amount, applied = 0;
+  for (const bill of bills) {
+    if (remaining <= 0) break;
+    const toPay = Math.min(remaining, bill.amountDue);
+    bill.amountPaid = (bill.amountPaid || 0) + toPay;
+    bill.amountDue  = Math.max(0, bill.amountDue - toPay);
+    bill.paymentStatus = bill.amountDue === 0 ? 'paid' : 'partial';
+    if (bill.amountDue === 0 && !bill.staffEarning)
+      bill.staffEarning = (bill.services || []).reduce((s, l) => s + (l.staffEarning || 0), 0);
+    if (creditStaffId) bill.staff = creditStaffId;
+    await bill.save();
+    remaining -= toPay;
+    applied += toPay;
+  }
+  await syncCustomerPending(saloonId, customerId);
+  return applied;
+}
+
+// Staff record inside the caller's saloon, or null (also for malformed ids)
+function findSaloonStaff(saloonId, id) {
+  if (!isId(String(id || ''))) return Promise.resolve(null);
+  return SaloonStaff.findOne({ _id: id, saloon: saloonId });
+}
+
+function phoneTaken(saloonId, phone, exceptId) {
+  const q = { saloon: saloonId, phone: { $in: phoneVariants(phone) } };
+  if (exceptId) q._id = { $ne: exceptId };
+  return SaloonStaff.exists(q);
+}
+
+// Who may change whom. Owner manages everyone (but stays owner and active);
+// a manager manages only staff below manager, plus limited edits of themselves.
+function staffChangeError(actor, target, body = {}) {
+  const self = String(actor._id) === String(target._id);
+  if (actor.role === 'manager' && !self && MANAGERS.includes(target.role))
+    return 'Managers can only manage staff below manager.';
+  if (actor.role === 'manager' && self &&
+      ['role', 'isActive', 'salary', 'commissionType', 'commissionValue'].some(f => body[f] !== undefined && String(body[f]) !== String(target[f])))
+    return 'Managers cannot change their own role, pay or status.';
+  if (body.role !== undefined && body.role !== target.role) {
+    if (target.role === 'owner') return 'The owner role cannot be changed.';
+    if (body.role === 'owner')   return 'A saloon has exactly one owner.';
+    if (body.role === 'manager' && actor.role !== 'owner') return 'Only the owner can make someone a manager.';
+  }
+  if (target.role === 'owner' && body.isActive === false) return 'The owner account cannot be deactivated.';
+  return null;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // AUTH
 // ════════════════════════════════════════════════════════════════════════════
+router.use('/auth', authIpLimit);
 
 // POST /api/saloon/auth/register
-router.post('/auth/register', async (req, res) => {
+router.post('/auth/register', registerLimit, async (req, res) => {
   try {
-    const { ownerName, businessName, email, phone, password, businessType, city, gstin } = req.body;
-    if (!ownerName || !businessName || !email || !phone || !password)
+    const { ownerName, businessName, email, phone: rawPhone, password, businessType, city, gstin } = req.body;
+    if (!ownerName || !businessName || !email || !rawPhone || !password)
       return res.status(400).json({ message: 'ownerName, businessName, email, phone and password are required.' });
+    if (!isEmail(email)) return res.status(400).json({ message: 'Please enter a valid email address.' });
+    const phone = normPhone(rawPhone);
+    if (!isPhone(phone)) return res.status(400).json({ message: 'Please enter a valid mobile number.' });
+    if (weakPassword(password)) return res.status(400).json({ message: pwMsg });
 
-    const existing = await SaloonBusiness.findOne({ $or: [{ email: email.toLowerCase() }, { phone: phone.trim() }] });
+    const em = String(email).toLowerCase().trim();
+    const existing = await SaloonBusiness.findOne({ $or: [{ email: em }, { phone: { $in: phoneVariants(phone) } }] });
     if (existing) return res.status(409).json({ message: 'Email or phone already registered.' });
 
-    let base = slugify(businessName), slug = base, n = 1;
+    let base = slugify(String(businessName)), slug = base, n = 1;
     while (await SaloonBusiness.findOne({ slug })) slug = `${base}-${n++}`;
 
     // Determine trial duration from AppConfig
-    const AppConfig = require('../models/AppConfig');
     const cfg = await AppConfig.findOne({ key: 'global' }).lean();
     const trialDays = cfg?.defaultTrialDays ?? 30;
     const trialEndsAt = new Date(Date.now() + trialDays * 24 * 60 * 60 * 1000);
@@ -139,10 +274,10 @@ router.post('/auth/register', async (req, res) => {
     const saloonCode = await generateSaloonCode();
 
     const saloon = await SaloonBusiness.create({
-      businessName: businessName.trim(),
-      ownerName: ownerName.trim(),
-      email: email.toLowerCase().trim(),
-      phone: phone.trim(),
+      businessName: String(businessName).trim(),
+      ownerName: String(ownerName).trim(),
+      email: em,
+      phone,
       password,
       slug,
       saloonCode,
@@ -152,26 +287,28 @@ router.post('/auth/register', async (req, res) => {
       subscription: {
         status: 'trial',
         trialEndsAt,
-        monthlyRate: cfg?.defaultMonthlyRate || 999
+        monthlyRate: cfg?.defaultMonthlyRate ?? 999
       }
     });
 
-    const owner = await SaloonStaff.create({
-      saloon: saloon._id,
-      name: ownerName.trim(),
-      email: email.toLowerCase().trim(),
-      phone: phone.trim(),
-      password,
-      role: 'owner'
-    });
+    let owner, token;
+    try {
+      owner = new SaloonStaff({
+        saloon: saloon._id,
+        name: String(ownerName).trim(),
+        email: em,
+        phone,
+        password,
+        role: 'owner'
+      });
+      token = issueToken(owner);
+      await owner.save();
+    } catch (err) {
+      await SaloonBusiness.deleteOne({ _id: saloon._id }); // don't leave a saloon nobody can log into
+      throw err;
+    }
 
-    const token = makeToken(owner._id, saloon._id, 'owner');
-    owner.token = token;
-    await owner.save({ validateBeforeSave: false });
-    saloon.token = token;
-    await saloon.save({ validateBeforeSave: false });
-
-    logActivity(req, saloon, 'register', { actor: ownerName, actorRole: 'owner', details: { businessType: saloon.businessType, city } });
+    logActivity(req, saloon, 'register', { actor: owner.name, actorRole: 'owner', details: { businessType: saloon.businessType, city } });
     res.status(201).json({
       message: 'Saloon registered.',
       token,
@@ -181,9 +318,16 @@ router.post('/auth/register', async (req, res) => {
     });
   } catch (err) {
     if (err.code === 11000) return res.status(409).json({ message: 'Email or phone already registered.' });
-    res.status(500).json({ message: err.message });
+    sendError(res, err);
   }
 });
+
+// Mongo filter for "this mobile number or email"
+function identifierFilter(ident) {
+  return ident.includes('@')
+    ? { email: ident.toLowerCase() }
+    : { $or: [{ phone: { $in: phoneVariants(ident) } }, { email: ident.toLowerCase() }] };
+}
 
 // ── Unified login ────────────────────────────────────────────────────────────
 // Owner, manager and staff all live in SaloonStaff, so one login serves everyone.
@@ -196,17 +340,16 @@ async function handleLogin(req, res) {
     const ident = String(identifier || emailOrPhone || phone || '').trim();
     const code  = saloonCode || saloonId;
 
-    if (!ident || !password)
+    if (!ident || !password || typeof password !== 'string')
       return res.status(400).json({ message: 'Mobile number / email and password are required.' });
 
-    const byIdentifier = { $or: [{ email: ident.toLowerCase() }, { phone: ident }] };
-    let query = byIdentifier;
+    let query = identifierFilter(ident);
 
     // A saloon code (optional) narrows the search up front
     if (code) {
       const saloon = await resolveSaloon(code);
       if (!saloon) return res.status(404).json({ message: 'Saloon ID not found. Please check with your owner.' });
-      query = { saloon: saloon._id, ...byIdentifier };
+      query = { saloon: saloon._id, ...query };
     }
 
     const candidates = await SaloonStaff.find(query).limit(10);
@@ -214,7 +357,7 @@ async function handleLogin(req, res) {
       return res.status(401).json({ message: 'No account found with this mobile number or email.' });
 
     // The password decides which account is meant
-    const matches = [];
+    let matches = [];
     for (const c of candidates) {
       if (c.password && await c.comparePassword(password)) matches.push(c);
     }
@@ -223,10 +366,18 @@ async function handleLogin(req, res) {
       const noPassword = candidates.some(c => !c.password);
       return res.status(401).json({
         message: noPassword && candidates.length === 1
-          ? 'Password not set yet. Use "Forgot password" to set one.'
+          ? 'Password not set yet. Use "Forgot password" to get a code from your owner.'
           : 'Incorrect password.'
       });
     }
+
+    // Duplicates inside one saloon can't be told apart by choosing a saloon —
+    // keep the active, most recently used one.
+    const bySaloon = new Map();
+    matches
+      .sort((a, b) => (b.isActive - a.isActive) || ((b.lastLoginAt || 0) - (a.lastLoginAt || 0)))
+      .forEach(m => { if (!bySaloon.has(String(m.saloon))) bySaloon.set(String(m.saloon), m); });
+    matches = [...bySaloon.values()];
 
     // Same number and password at more than one saloon — let them pick
     if (matches.length > 1) {
@@ -252,29 +403,31 @@ async function handleLogin(req, res) {
       return res.status(403).json({ message: 'Saloon account inactive.' });
 
     // Backfill the short saloon code for accounts created before it existed
-    if (!saloon.saloonCode) saloon.saloonCode = await generateSaloonCode();
+    if (!saloon.saloonCode) {
+      saloon.saloonCode = await generateSaloonCode();
+      await saloon.save({ validateBeforeSave: false });
+    }
 
-    const token = makeToken(staff._id, saloon._id, staff.role);
-    staff.token = token;
+    const token = issueToken(staff);
     staff.lastLoginAt = new Date();
     staff.loginCount = (staff.loginCount || 0) + 1;
     // A successful login voids any outstanding reset request
     staff.resetOtp = undefined;
     staff.resetOtpExpiresAt = undefined;
     staff.resetRequestedAt = undefined;
+    staff.resetOtpAttempts = 0;
     await staff.save({ validateBeforeSave: false });
-    await saloon.save({ validateBeforeSave: false });
 
-    logActivity(req, saloon, ['owner', 'manager'].includes(staff.role) ? 'login' : 'staff_login',
+    logActivity(req, saloon, isManager(staff) ? 'login' : 'staff_login',
                 { actor: staff.name, actorRole: staff.role });
     res.json({ token, staff: staff.toSafeObject(), saloon: saloon.toSafeObject() });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 }
 
 // POST /api/saloon/auth/login — everyone signs in here
-router.post('/auth/login', handleLogin);
+router.post('/auth/login', loginLimit, handleLogin);
 // Kept so older app builds keep working; same handler.
-router.post('/auth/staff-login', handleLogin);
+router.post('/auth/staff-login', loginLimit, handleLogin);
 
 // GET /api/saloon/auth/saloon-lookup/:code — confirm a saloon code before login
 router.get('/auth/saloon-lookup/:code', async (req, res) => {
@@ -282,58 +435,58 @@ router.get('/auth/saloon-lookup/:code', async (req, res) => {
     const saloon = await resolveSaloon(req.params.code);
     if (!saloon || !saloon.isActive) return res.status(404).json({ message: 'Saloon ID not found.' });
     res.json({ saloonCode: saloon.saloonCode || '', businessName: saloon.businessName });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
-// POST /api/saloon/auth/pin-login  (staff PIN login)
-router.post('/auth/pin-login', async (req, res) => {
+// POST /api/saloon/auth/pin-login  (staff PIN login, legacy)
+router.post('/auth/pin-login', pinLimit, async (req, res) => {
   try {
     const { saloonId, pin } = req.body;
     if (!saloonId || !pin) return res.status(400).json({ message: 'saloonId and pin required.' });
 
-    const staffList = await SaloonStaff.find({ saloon: saloonId, isActive: true, pin: { $exists: true, $ne: null } });
+    const saloon = await resolveSaloon(saloonId);
+    if (!saloon) return res.status(401).json({ message: 'Invalid PIN.' });
+    if (!saloon.isActive) return res.status(403).json({ message: 'Saloon account inactive.' });
+
+    const staffList = await SaloonStaff.find({ saloon: saloon._id, isActive: true, pin: { $exists: true, $ne: null } });
     let matched = null;
     for (const s of staffList) {
-      if (s.pin && await s.comparePin(pin)) { matched = s; break; }
+      if (s.pin && await s.comparePin(String(pin))) { matched = s; break; }
     }
     if (!matched) return res.status(401).json({ message: 'Invalid PIN.' });
 
-    const saloon = await SaloonBusiness.findById(saloonId);
-    if (!saloon || !saloon.isActive) return res.status(403).json({ message: 'Saloon account inactive.' });
-
-    const token = makeToken(matched._id, saloon._id, matched.role);
-    matched.token = token;
+    const token = issueToken(matched);
     matched.lastLoginAt = new Date();
     matched.loginCount = (matched.loginCount || 0) + 1;
     await matched.save({ validateBeforeSave: false });
 
     logActivity(req, saloon, 'pin_login', { actor: matched.name, actorRole: matched.role });
     res.json({ token, staff: matched.toSafeObject(), saloon: saloon.toSafeObject() });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
-// Resolve the staff records an identifier could mean, optionally scoped to a saloon.
+// Resolve the staff record an identifier could mean, optionally scoped to a saloon.
 // Returns { error } | { staff } | { choose: [...] }
 async function resolveStaffByIdentifier(ident, code) {
   const id = String(ident || '').trim();
   if (!id) return { error: { status: 400, message: 'Mobile number or email is required.' } };
 
-  const byIdentifier = { $or: [{ email: id.toLowerCase() }, { phone: id }] };
-  let query = byIdentifier;
+  let query = identifierFilter(id);
 
   if (code) {
     const saloon = await resolveSaloon(code);
     if (!saloon) return { error: { status: 404, message: 'Saloon ID not found. Please check with your owner.' } };
-    query = { saloon: saloon._id, ...byIdentifier };
+    query = { saloon: saloon._id, ...query };
   }
 
-  const candidates = await SaloonStaff.find(query).limit(10);
+  const candidates = await SaloonStaff.find(query).sort({ isActive: -1, lastLoginAt: -1 }).limit(10);
   if (!candidates.length)
     return { error: { status: 404, message: 'No account found with this mobile number or email.' } };
 
-  if (candidates.length === 1) return { staff: candidates[0] };
+  const saloonIds = [...new Set(candidates.map(c => String(c.saloon)))];
+  if (saloonIds.length === 1) return { staff: candidates[0] };
 
-  const saloons = await SaloonBusiness.find({ _id: { $in: candidates.map(c => c.saloon) } })
+  const saloons = await SaloonBusiness.find({ _id: { $in: saloonIds } })
     .select('businessName saloonCode isActive').lean();
   return {
     choose: saloons.filter(x => x.isActive !== false).map(x => ({
@@ -341,21 +494,28 @@ async function resolveStaffByIdentifier(ident, code) {
     }))
   };
 }
+const chooseReply = (res, saloons) => res.status(409).json({
+  code: 'CHOOSE_SALOON',
+  message: 'This mobile number is used at more than one saloon. Please choose which one.',
+  saloons
+});
+const OWNER_RESET = {
+  code: 'OWNER_RESET',
+  message: 'Owner passwords cannot be reset from the app. Please contact support to reset it.'
+};
 
 // POST /api/saloon/auth/staff/forgot-password
-// Staff ask for a reset; the OTP is shown to the owner inside the app, who reads it out.
-router.post('/auth/staff/forgot-password', async (req, res) => {
+// Staff ask for a reset (or a first password); the OTP is shown to the owner
+// inside the app, who reads it out. Nothing about the account is revealed here.
+router.post('/auth/staff/forgot-password', forgotLimit, async (req, res) => {
   try {
     const { identifier, phone, saloonCode, saloonId } = req.body;
     const found = await resolveStaffByIdentifier(identifier || phone, saloonCode || saloonId);
     if (found.error)  return res.status(found.error.status).json({ message: found.error.message });
-    if (found.choose) return res.status(409).json({
-      code: 'CHOOSE_SALOON',
-      message: 'This mobile number is used at more than one saloon. Please choose which one.',
-      saloons: found.choose
-    });
+    if (found.choose) return chooseReply(res, found.choose);
 
     const staff = found.staff;
+    if (staff.role === 'owner') return res.status(400).json(OWNER_RESET);
     if (!staff.isActive)
       return res.status(403).json({ message: 'Your account has been deactivated. Contact your owner.' });
 
@@ -365,6 +525,7 @@ router.post('/auth/staff/forgot-password', async (req, res) => {
     staff.resetOtp = makeOtp();
     staff.resetOtpExpiresAt = new Date(Date.now() + OTP_TTL_MS);
     staff.resetRequestedAt = new Date();
+    staff.resetOtpAttempts = 0;
     await staff.save({ validateBeforeSave: false });
 
     logActivity(req, saloon, 'staff_forgot_password', {
@@ -373,44 +534,55 @@ router.post('/auth/staff/forgot-password', async (req, res) => {
     });
 
     res.json({
-      message: 'OTP sent to your owner. Ask them for the 6-digit code.',
-      staffName: staff.name,
-      ownerName: saloon.ownerName,
-      businessName: saloon.businessName,
+      message: 'A 6-digit code has been sent to your saloon owner\'s app. Ask them for it.',
       expiresInMinutes: Math.round(OTP_TTL_MS / 60000)
     });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // POST /api/saloon/auth/staff/reset-password  (verify OTP → set a new password)
-router.post('/auth/staff/reset-password', async (req, res) => {
+router.post('/auth/staff/reset-password', otpLimit, async (req, res) => {
   try {
     const { identifier, phone, otp, password, saloonCode, saloonId } = req.body;
     if (!otp || !password)
       return res.status(400).json({ message: 'OTP and new password are required.' });
-    if (String(password).length < 6)
-      return res.status(400).json({ message: 'Password must be at least 6 characters.' });
+    if (weakPassword(password)) return res.status(400).json({ message: pwMsg });
 
     const found = await resolveStaffByIdentifier(identifier || phone, saloonCode || saloonId);
     if (found.error)  return res.status(found.error.status).json({ message: found.error.message });
-    if (found.choose) return res.status(409).json({
-      code: 'CHOOSE_SALOON',
-      message: 'This mobile number is used at more than one saloon. Please choose which one.',
-      saloons: found.choose
-    });
+    if (found.choose) return chooseReply(res, found.choose);
 
     const staff = found.staff;
+    if (staff.role === 'owner') return res.status(400).json(OWNER_RESET);
     if (!staff.resetOtp || !staff.resetOtpExpiresAt)
       return res.status(400).json({ message: 'No OTP requested. Please tap "Forgot password" first.' });
     if (new Date(staff.resetOtpExpiresAt) < new Date())
       return res.status(400).json({ message: 'OTP expired. Please request a new one.' });
-    if (String(staff.resetOtp) !== String(otp).trim())
-      return res.status(401).json({ message: 'Incorrect OTP. Please check with your owner.' });
+
+    if (String(staff.resetOtp) !== String(otp).trim()) {
+      staff.resetOtpAttempts = (staff.resetOtpAttempts || 0) + 1;
+      // Too many guesses burns the code, so a 6-digit OTP can't be brute-forced
+      if (staff.resetOtpAttempts >= OTP_MAX_ATTEMPTS) {
+        staff.resetOtp = undefined;
+        staff.resetOtpExpiresAt = undefined;
+        staff.resetRequestedAt = undefined;
+        staff.resetOtpAttempts = 0;
+        await staff.save({ validateBeforeSave: false });
+        return res.status(400).json({ code: 'OTP_LOCKED', message: 'Too many wrong codes. Please request a new one.' });
+      }
+      await staff.save({ validateBeforeSave: false });
+      return res.status(400).json({
+        message: `Incorrect OTP. Please check with your owner. (${OTP_MAX_ATTEMPTS - staff.resetOtpAttempts} attempts left)`
+      });
+    }
 
     staff.password = password;
     staff.resetOtp = undefined;
     staff.resetOtpExpiresAt = undefined;
     staff.resetRequestedAt = undefined;
+    staff.resetOtpAttempts = 0;
+    staff.token = undefined;
+    staff.tokens = [];        // a reset signs out every device
     await staff.save();
 
     const saloon = await SaloonBusiness.findById(staff.saloon).lean();
@@ -419,36 +591,33 @@ router.post('/auth/staff/reset-password', async (req, res) => {
       actor: staff.name, actorRole: staff.role
     });
     res.json({ message: 'Password changed. You can now log in.' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
-// POST /api/saloon/auth/staff/set-password  (first-time password setup with the staff PIN)
-router.post('/auth/staff/set-password', async (req, res) => {
+// POST /api/saloon/auth/staff/set-password  (first-time setup with the staff PIN)
+// Without a PIN, first-time staff use the forgot-password flow instead, so an
+// account can never be claimed by someone who only knows the mobile number.
+router.post('/auth/staff/set-password', passwordLimit, async (req, res) => {
   try {
     const { identifier, phone, pin, password, saloonCode, saloonId } = req.body;
     if (!password) return res.status(400).json({ message: 'Password is required.' });
+    if (weakPassword(password)) return res.status(400).json({ message: pwMsg });
+    if (!pin) return res.status(400).json({
+      code: 'PIN_REQUIRED',
+      message: 'Enter the PIN your owner gave you, or tap "No PIN?" to get a code from your owner.'
+    });
 
     const found = await resolveStaffByIdentifier(identifier || phone, saloonCode || saloonId);
     if (found.error)  return res.status(found.error.status).json({ message: found.error.message });
-    if (found.choose) return res.status(409).json({
-      code: 'CHOOSE_SALOON',
-      message: 'This mobile number is used at more than one saloon. Please choose which one.',
-      saloons: found.choose
-    });
+    if (found.choose) return chooseReply(res, found.choose);
 
     const staff = found.staff;
-
-    // A password can only be set without a PIN the very first time. After that a
-    // reset has to go through the owner-approved OTP flow.
-    if (staff.password && !pin)
-      return res.status(401).json({ message: 'Password already set. Use "Forgot password" to reset it.' });
-
-    if (pin) {
-      if (!staff.pin || !await staff.comparePin(pin))
-        return res.status(401).json({ message: 'Invalid PIN.' });
-    }
+    if (!staff.pin || !await staff.comparePin(String(pin)))
+      return res.status(401).json({ message: 'Invalid PIN.' });
 
     staff.password = password;
+    staff.token = undefined;
+    staff.tokens = [];
     await staff.save();
 
     const saloonForLog = await SaloonBusiness.findById(staff.saloon).lean();
@@ -456,15 +625,21 @@ router.post('/auth/staff/set-password', async (req, res) => {
       logActivity(req, saloonForLog, 'staff_set_password', { entity: 'staff', entityId: staff._id, entityName: staff.name });
     }
     res.json({ message: 'Password set successfully.' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
-// POST /api/saloon/auth/logout
-router.post('/auth/logout', saloonAuth, async (req, res) => {
+// POST /api/saloon/auth/logout — signs out this device only. Session check only,
+// so it works even while the subscription is expired or the app is in service mode.
+router.post('/auth/logout', saloonAuth.sessionOnly, async (req, res) => {
   try {
-    await SaloonStaff.findByIdAndUpdate(req.staff._id, { $unset: { token: 1 } });
+    const staff = await SaloonStaff.findById(req.staff._id).select('token tokens');
+    if (staff) {
+      if (staff.token === req.token) staff.token = undefined;
+      staff.tokens = (staff.tokens || []).filter(t => t !== req.token);
+      await staff.save({ validateBeforeSave: false });
+    }
     res.json({ message: 'Logged out.' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // GET /api/saloon/auth/me
@@ -477,47 +652,84 @@ router.get('/auth/me', saloonAuth, async (req, res) => {
 });
 
 // POST /api/saloon/auth/change-password  (staff change their own password)
-router.post('/auth/change-password', saloonAuth, async (req, res) => {
+// Keeps this device signed in and signs out every other one.
+router.post('/auth/change-password', saloonAuth, passwordLimit, async (req, res) => {
   try {
     const { oldPassword, newPassword } = req.body;
     if (!oldPassword || !newPassword) return res.status(400).json({ message: 'oldPassword and newPassword required.' });
+    if (weakPassword(newPassword)) return res.status(400).json({ message: pwMsg });
 
     const staff = await SaloonStaff.findById(req.staff._id);
     if (!staff) return res.status(404).json({ message: 'Staff not found.' });
 
-    // Verify old password
-    if (!await staff.comparePassword(oldPassword)) return res.status(401).json({ message: 'Current password is incorrect.' });
+    // 400, not 401 — a 401 means "session gone" to the app and would log the user out
+    if (!staff.password || !await staff.comparePassword(String(oldPassword)))
+      return res.status(400).json({ message: 'Current password is incorrect.' });
 
-    // Set new password
     staff.password = newPassword;
+    staff.token = undefined;
+    staff.tokens = [req.token];
     await staff.save();
 
     logActivity(req, req.saloon, 'staff_change_password', { entity: 'staff', entityId: staff._id, entityName: staff.name });
     res.json({ message: 'Password changed successfully.' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
+});
+
+// DELETE /api/saloon/account — owner permanently deletes the saloon and all its data
+// (Play Store account-deletion requirement). Works even when the subscription has lapsed.
+router.delete('/account', saloonAuth.sessionOnly, requireRole('owner'), passwordLimit, async (req, res) => {
+  try {
+    const { password, confirmName } = req.body || {};
+    const saloon = await SaloonBusiness.findById(req.staff.saloon);
+    if (!saloon) return res.status(404).json({ message: 'Saloon not found.' });
+
+    if (String(confirmName || '').trim() !== saloon.businessName.trim())
+      return res.status(400).json({ message: `Type the exact business name "${saloon.businessName}" to confirm.` });
+    const owner = await SaloonStaff.findById(req.staff._id);
+    if (!password || !owner?.password || !await owner.comparePassword(String(password)))
+      return res.status(400).json({ message: 'Password is incorrect.' });
+
+    const removed = await deleteSaloonData(saloon);
+    // One record survives so the deletion itself is auditable (no personal data)
+    await BusinessActivityLog.create({
+      bizType: 'saloon', business: saloon._id, businessName: saloon.businessName,
+      actor: 'owner', actorRole: 'owner', action: 'account_delete', entity: 'saloon',
+      entityId: saloon._id, details: { removed }, ip: req.ip || ''
+    }).catch(() => {});
+
+    console.warn(`🗑️  Owner deleted saloon "${saloon.businessName}" (${saloon._id})`);
+    res.json({ message: 'Your saloon account and all of its data have been deleted.' });
+  } catch (err) { sendError(res, err); }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
 // STAFF MANAGEMENT  (owner / manager only)
 // ════════════════════════════════════════════════════════════════════════════
 
+const STAFF_HIDDEN = '-password -pin -token -tokens -resetOtp -resetOtpExpiresAt -resetOtpAttempts';
+
 // GET /api/saloon/staff
 router.get('/staff', saloonAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
     const list = await SaloonStaff.find({ saloon: req.saloon._id })
-      .select('-password -pin -token -resetOtp -resetOtpExpiresAt').sort({ createdAt: 1 }).lean();
+      .select(STAFF_HIDDEN).sort({ createdAt: 1 }).lean();
     res.json(list);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
-// GET /api/saloon/staff/password-requests — pending staff password-reset OTPs
+// GET /api/saloon/staff/password-requests — pending staff password-reset OTPs.
+// Managers only see requests from staff below them.
 router.get('/staff/password-requests', saloonAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
-    const list = await SaloonStaff.find({
+    const q = {
       saloon: req.saloon._id,
+      role: req.staff.role === 'owner' ? { $ne: 'owner' } : { $nin: MANAGERS },
       resetOtp: { $ne: null },
       resetOtpExpiresAt: { $gt: new Date() }
-    }).select('name phone role avatar resetOtp resetOtpExpiresAt resetRequestedAt')
+    };
+    const list = await SaloonStaff.find(q)
+      .select('name phone role avatar resetOtp resetOtpExpiresAt resetRequestedAt')
       .sort({ resetRequestedAt: -1 }).lean();
 
     res.json(list.map(s => ({
@@ -530,104 +742,163 @@ router.get('/staff/password-requests', saloonAuth, requireRole('owner', 'manager
       requestedAt: s.resetRequestedAt,
       expiresAt: s.resetOtpExpiresAt
     })));
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
-// POST /api/saloon/staff/:id/password-otp — owner generates an OTP for a staff member
+// Loads a staff member the caller is allowed to manage, or replies with the reason
+async function manageableStaff(req, res, body) {
+  const staff = await findSaloonStaff(req.saloon._id, req.params.id);
+  if (!staff) { res.status(404).json({ message: 'Staff not found.' }); return null; }
+  const why = staffChangeError(req.staff, staff, body);
+  if (why) { res.status(403).json({ message: why }); return null; }
+  return staff;
+}
+
+// POST /api/saloon/staff/:id/password-otp — owner/manager generates an OTP for a staff member
 router.post('/staff/:id/password-otp', saloonAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
-    const staff = await SaloonStaff.findOne({ _id: req.params.id, saloon: req.saloon._id });
-    if (!staff) return res.status(404).json({ message: 'Staff not found.' });
+    const staff = await manageableStaff(req, res);
+    if (!staff) return;
+    if (staff.role === 'owner') return res.status(400).json(OWNER_RESET);
 
     staff.resetOtp = makeOtp();
     staff.resetOtpExpiresAt = new Date(Date.now() + OTP_TTL_MS);
     staff.resetRequestedAt = new Date();
+    staff.resetOtpAttempts = 0;
     await staff.save({ validateBeforeSave: false });
 
     logActivity(req, req.saloon, 'staff_otp_issued', { entity: 'staff', entityId: staff._id, entityName: staff.name });
     res.json({ otp: staff.resetOtp, expiresAt: staff.resetOtpExpiresAt, name: staff.name, phone: staff.phone });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
-// DELETE /api/saloon/staff/:id/password-otp — owner dismisses a reset request
+// DELETE /api/saloon/staff/:id/password-otp — owner/manager dismisses a reset request
 router.delete('/staff/:id/password-otp', saloonAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
-    const staff = await SaloonStaff.findOneAndUpdate(
-      { _id: req.params.id, saloon: req.saloon._id },
-      { $unset: { resetOtp: 1, resetOtpExpiresAt: 1, resetRequestedAt: 1 } },
-      { new: true }
-    );
-    if (!staff) return res.status(404).json({ message: 'Staff not found.' });
+    const staff = await manageableStaff(req, res);
+    if (!staff) return;
+    await SaloonStaff.updateOne({ _id: staff._id },
+      { $unset: { resetOtp: 1, resetOtpExpiresAt: 1, resetRequestedAt: 1 }, $set: { resetOtpAttempts: 0 } });
     res.json({ message: 'Request dismissed.' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // POST /api/saloon/staff
 router.post('/staff', saloonAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
-    const { name, email, phone, role, pin, password, specializations, salary, commissionType, commissionValue, designation, joiningDate } = req.body;
+    const { name, email, phone: rawPhone, role, pin, password, specializations, salary, commissionType, commissionValue, designation, joiningDate } = req.body;
     if (!name || !role) return res.status(400).json({ message: 'name and role are required.' });
+    if (role === 'owner') return res.status(400).json({ message: 'A saloon has exactly one owner.' });
+    if (role === 'manager' && req.staff.role !== 'owner')
+      return res.status(403).json({ message: 'Only the owner can add a manager.' });
+    if (password && weakPassword(password)) return res.status(400).json({ message: pwMsg });
+    if (email && !isEmail(email)) return res.status(400).json({ message: 'Please enter a valid email address.' });
+
+    const phone = rawPhone ? normPhone(rawPhone) : undefined;
+    if (phone && !isPhone(phone)) return res.status(400).json({ message: 'Please enter a valid mobile number.' });
+    if (phone && await phoneTaken(req.saloon._id, phone))
+      return res.status(409).json({ message: 'Another staff member in this saloon already uses this mobile number.' });
 
     const staff = await SaloonStaff.create({
       saloon: req.saloon._id,
-      name: name.trim(), email, phone,
-      role, pin, password,
-      specializations: specializations || [],
-      salary: salary || 0,
+      name: String(name).trim(), email: email || undefined, phone,
+      role, pin: pin ? String(pin) : undefined, password: password || undefined,
+      specializations: Array.isArray(specializations) ? specializations : [],
+      salary: toNum(salary) ?? 0,
       commissionType: commissionType || 'percent',
-      commissionValue: commissionValue ?? req.saloon.settings?.commissionValue ?? 50,
-      designation, joiningDate
+      commissionValue: toNum(commissionValue) ?? req.saloon.settings?.commissionValue ?? 50,
+      designation, joiningDate: joiningDate || undefined
     });
     logActivity(req, req.saloon, 'staff_create', { entity: 'staff', entityId: staff._id, entityName: staff.name, details: { role } });
     res.status(201).json(staff.toSafeObject());
   } catch (err) {
     if (err.code === 11000) return res.status(409).json({ message: 'Phone or email already used.' });
-    res.status(500).json({ message: err.message });
+    sendError(res, err);
   }
 });
 
 // PUT /api/saloon/staff/:id
 router.put('/staff/:id', saloonAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
-    const staff = await SaloonStaff.findOne({ _id: req.params.id, saloon: req.saloon._id });
-    if (!staff) return res.status(404).json({ message: 'Staff not found.' });
+    const body = { ...req.body };
+    if (body.role === '' || body.role === null) delete body.role;   // the owner row has no role option in the form
+    const staff = await manageableStaff(req, res, body);
+    if (!staff) return;
+
+    if (body.password && weakPassword(body.password)) return res.status(400).json({ message: pwMsg });
+    if (body.email && !isEmail(body.email)) return res.status(400).json({ message: 'Please enter a valid email address.' });
+    if (body.phone !== undefined) {
+      body.phone = body.phone ? normPhone(body.phone) : undefined;
+      if (body.phone && !isPhone(body.phone)) return res.status(400).json({ message: 'Please enter a valid mobile number.' });
+      if (body.phone && await phoneTaken(req.saloon._id, body.phone, staff._id))
+        return res.status(409).json({ message: 'Another staff member in this saloon already uses this mobile number.' });
+    }
+
+    // The owner's email/phone are also the saloon's platform-wide identity
+    if (staff.role === 'owner') {
+      const biz = {};
+      if (body.phone && body.phone !== staff.phone) {
+        if (await SaloonBusiness.exists({ _id: { $ne: req.saloon._id }, phone: { $in: phoneVariants(body.phone) } }))
+          return res.status(409).json({ message: 'Another saloon already uses this mobile number.' });
+        biz.phone = body.phone;
+      }
+      if (body.email && body.email.toLowerCase().trim() !== staff.email) {
+        const em = body.email.toLowerCase().trim();
+        if (await SaloonBusiness.exists({ _id: { $ne: req.saloon._id }, email: em }))
+          return res.status(409).json({ message: 'Another saloon already uses this email.' });
+        biz.email = em;
+      }
+      if (body.name) biz.ownerName = String(body.name).trim();
+      if (Object.keys(biz).length) await SaloonBusiness.updateOne({ _id: req.saloon._id }, { $set: biz });
+    }
 
     const fields = ['name', 'email', 'phone', 'role', 'specializations', 'salary', 'commissionType', 'commissionValue', 'designation', 'joiningDate', 'isActive'];
-    fields.forEach(f => { if (req.body[f] !== undefined) staff[f] = req.body[f]; });
+    fields.forEach(f => { if (body[f] !== undefined) staff[f] = body[f]; });
 
-    if (req.body.password) staff.password = req.body.password;
-    if (req.body.pin)      staff.pin      = req.body.pin;
+    const credsChanged = !!(body.password || body.pin);
+    if (body.password) staff.password = body.password;
+    if (body.pin)      staff.pin      = String(body.pin);
 
     await staff.save();
+
+    // New credentials or deactivation sign the person out (keeping the caller's own device)
+    if (credsChanged || body.isActive === false) {
+      const self = String(staff._id) === String(req.staff._id);
+      await revokeSessions(staff._id, self ? req.token : undefined);
+    }
+
     logActivity(req, req.saloon, 'staff_update', { entity: 'staff', entityId: staff._id, entityName: staff.name });
     res.json(staff.toSafeObject());
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // DELETE /api/saloon/staff/:id
 router.delete('/staff/:id', saloonAuth, requireRole('owner'), async (req, res) => {
   try {
-    const staff = await SaloonStaff.findOne({ _id: req.params.id, saloon: req.saloon._id });
+    const staff = await findSaloonStaff(req.saloon._id, req.params.id);
     if (!staff) return res.status(404).json({ message: 'Staff not found.' });
     if (staff.role === 'owner') return res.status(400).json({ message: 'Cannot delete owner.' });
     logActivity(req, req.saloon, 'staff_delete', { entity: 'staff', entityId: staff._id, entityName: staff.name });
     await SaloonStaff.findByIdAndDelete(staff._id);
     res.json({ message: 'Staff deleted.' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // POST /api/saloon/staff/:id/avatar
-router.post('/staff/:id/avatar', saloonAuth, requireRole('owner', 'manager'), uploadPhoto.single('photo'), async (req, res) => {
+router.post('/staff/:id/avatar', saloonAuth, requireRole('owner', 'manager'), async (req, res, next) => {
+  try {
+    const staff = await manageableStaff(req, res);
+    if (!staff) return;
+    req.targetStaff = staff;
+    next();
+  } catch (err) { sendError(res, err); }
+}, uploadPhoto.single('photo'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
-    const staff = await SaloonStaff.findOneAndUpdate(
-      { _id: req.params.id, saloon: req.saloon._id },
-      { avatar: req.file.path },
-      { new: true }
-    );
-    if (!staff) return res.status(404).json({ message: 'Staff not found.' });
-    res.json({ avatar: staff.avatar });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+    req.targetStaff.avatar = req.file.path;
+    await req.targetStaff.save({ validateBeforeSave: false });
+    res.json({ avatar: req.targetStaff.avatar });
+  } catch (err) { sendError(res, err); }
 });
 
 // GET /api/saloon/staff/:id/pending-customers — customers with pending amount billed by this staff
@@ -635,8 +906,9 @@ router.post('/staff/:id/avatar', saloonAuth, requireRole('owner', 'manager'), up
 router.get('/staff/:id/pending-customers', saloonAuth, async (req, res) => {
   try {
     const staffId = req.params.id;
+    if (!isId(staffId)) return res.status(400).json({ message: 'Invalid staff id.' });
     // Staff can only view their own pending customers
-    if (!['owner', 'manager'].includes(req.staff.role) && req.staff._id.toString() !== staffId) {
+    if (!isManager(req.staff) && req.staff._id.toString() !== staffId) {
       return res.status(403).json({ message: 'Access denied.' });
     }
 
@@ -645,7 +917,7 @@ router.get('/staff/:id/pending-customers', saloonAuth, async (req, res) => {
       {
         $match: {
           saloon: req.saloon._id,
-          staff:  new mongoose.Types.ObjectId(staffId),
+          staff:  oid(staffId),
           paymentStatus: { $in: ['pending', 'partial'] },
           amountDue: { $gt: 0 },
           customer: { $exists: true, $ne: null }
@@ -678,7 +950,7 @@ router.get('/staff/:id/pending-customers', saloonAuth, async (req, res) => {
     })).sort((a, b) => b.pendingAmount - a.pendingAmount);
 
     res.json(result);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -689,31 +961,22 @@ router.get('/staff/:id/pending-customers', saloonAuth, async (req, res) => {
 router.post('/collection-requests', saloonAuth, async (req, res) => {
   try {
     const { customerId, amount, paymentMode, notes } = req.body;
-    if (!customerId || !amount || parseFloat(amount) <= 0)
+    const requested = toNum(amount);
+    if (!customerId || !Number.isFinite(requested) || requested <= 0)
       return res.status(400).json({ message: 'customerId and amount required.' });
+    if (!isId(String(customerId))) return res.status(400).json({ message: 'Invalid customer id.' });
+    if (!payModeOf(paymentMode)) return res.status(400).json({ message: PAY_MODE_MSG });
 
     const customer = await SaloonCustomer.findOne({ _id: customerId, saloon: req.saloon._id });
     if (!customer) return res.status(404).json({ message: 'Customer not found.' });
 
-    // Verify this customer actually has pending amount from this staff's bills
-    const pendingSum = await SaloonWorkEntry.aggregate([
-      { $match: {
-        saloon: req.saloon._id,
-        staff: req.staff._id,
-        customer: customer._id,
-        paymentStatus: { $in: ['pending', 'partial'] },
-        amountDue: { $gt: 0 }
-      }},
-      { $group: { _id: null, total: { $sum: '$amountDue' } } }
-    ]);
-    const totalDue = pendingSum[0]?.total || 0;
-    // If owner/manager, allow collecting for any customer in saloon
-    const isManager = ['owner', 'manager'].includes(req.staff.role);
-    if (!isManager && totalDue <= 0)
-      return res.status(400).json({ message: 'No pending amount for this customer from your bills.' });
+    // Staff collect only against their own bills; owner/manager against any bill
+    const manager = isManager(req.staff);
+    const due = await livePending(req.saloon._id, customer._id, manager ? undefined : req.staff._id);
+    if (due <= 0)
+      return res.status(400).json({ message: manager ? 'No pending amount for this customer.' : 'No pending amount for this customer from your bills.' });
 
-    const collectAmt = Math.min(parseFloat(amount), isManager ? customer.pendingAmount : totalDue);
-    if (collectAmt <= 0) return res.status(400).json({ message: 'Nothing to collect.' });
+    const collectAmt = Math.min(requested, due);
 
     const creq = await SaloonCollectionRequest.create({
       saloon:          req.saloon._id,
@@ -721,94 +984,47 @@ router.post('/collection-requests', saloonAuth, async (req, res) => {
       customerName:    customer.name,
       customerPhone:   customer.phone,
       amount:          collectAmt,
-      paymentMode:     paymentMode || 'cash',
+      requestedAmount: requested,
+      paymentMode:     payModeOf(paymentMode),
       notes:           notes || '',
       requestedBy:     req.staff._id,
       requestedByName: req.staff.name,
-      status:          isManager ? 'approved' : 'pending'  // managers auto-approve
+      status:          manager ? 'approved' : 'pending'  // managers auto-approve
     });
 
     // If manager/owner — process immediately
-    if (isManager) {
-      await processCollectionApproval(creq, req.saloon, req.staff);
+    if (manager) {
+      const applied = await applyPayment({ saloonId: req.saloon._id, customerId: customer._id, amount: collectAmt });
+      creq.amount = applied;
+      creq.reviewedBy = req.staff._id;
+      creq.reviewedByName = req.staff.name;
+      creq.reviewedAt = new Date();
+      await creq.save();
     }
 
     logActivity(req, req.saloon, 'collection_request_submit', {
       entity: 'customer', entityId: customer._id, entityName: customer.name,
-      details: { amount: collectAmt, paymentMode, status: creq.status }
+      details: { amount: creq.amount, paymentMode: creq.paymentMode, status: creq.status }
     });
 
     res.status(201).json(creq);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
-// Shared helper — apply an approved collection to bills and customer
-async function processCollectionApproval(creq, saloon, reviewer) {
-  const customer = await SaloonCustomer.findById(creq.customer);
-  if (!customer) return;
-
-  // Use live work-entry sum — customer.pendingAmount can be stale
-  const liveAgg = await SaloonWorkEntry.aggregate([
-    { $match: { saloon: customer.saloon, customer: customer._id, paymentStatus: { $in: ['pending', 'partial'] }, amountDue: { $gt: 0 } } },
-    { $group: { _id: null, total: { $sum: '$amountDue' } } }
-  ]);
-  const livePending = liveAgg[0]?.total || 0;
-  const toCollect = Math.min(creq.amount, livePending > 0 ? livePending : creq.amount);
-
-  // Sync and reduce customer pendingAmount
-  customer.pendingAmount = Math.max(0, livePending - toCollect);
-  await customer.save();
-
-  // Mark bills as paid (oldest first)
-  const pendingBills = await SaloonWorkEntry.find({
-    saloon: customer.saloon,
-    customer: customer._id,
-    paymentStatus: { $in: ['pending', 'partial'] },
-    amountDue: { $gt: 0 }
-  }).sort({ serviceDate: 1 });
-
-  let remaining = toCollect;
-  for (const bill of pendingBills) {
-    if (remaining <= 0) break;
-    const toPay = Math.min(remaining, bill.amountDue);
-    bill.amountPaid = (bill.amountPaid || 0) + toPay;
-    bill.amountDue  = Math.max(0, bill.amountDue - toPay);
-    bill.paymentStatus = bill.amountDue === 0 ? 'paid' : 'partial';
-    if (bill.amountDue === 0) {
-      bill.staffEarning = bill.staffEarning || Math.round(bill.grandTotal * 0.4);
-    }
-    await bill.save();
-    remaining -= toPay;
-  }
-
-  // Mark request as approved with reviewer
-  if (reviewer) {
-    creq.status = 'approved';
-    creq.reviewedBy = reviewer._id;
-    creq.reviewedByName = reviewer.name;
-    creq.reviewedAt = new Date();
-    await creq.save();
-  }
-}
-
-// GET /api/saloon/collection-requests  — owner/manager sees all pending, staff sees their own
+// GET /api/saloon/collection-requests  — owner/manager sees all, staff sees their own
 router.get('/collection-requests', saloonAuth, async (req, res) => {
   try {
-    const { status, page = 1, limit = 30 } = req.query;
+    const { status } = req.query;
+    const { page, limit, skip } = pageParams(req.query, 30);
     const q = { saloon: req.saloon._id };
-    if (status) q.status = status;
-    // Staff see only their own requests
-    if (!['owner', 'manager'].includes(req.staff.role)) {
-      q.requestedBy = req.staff._id;
-    }
-    const requests = await SaloonCollectionRequest.find(q)
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(Number(limit))
-      .lean();
-    const total = await SaloonCollectionRequest.countDocuments(q);
-    res.json({ requests, total });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+    if (status) q.status = String(status);
+    if (!isManager(req.staff)) q.requestedBy = req.staff._id;
+    const [requests, total] = await Promise.all([
+      SaloonCollectionRequest.find(q).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      SaloonCollectionRequest.countDocuments(q)
+    ]);
+    res.json({ requests, total, page });
+  } catch (err) { sendError(res, err); }
 });
 
 // PATCH /api/saloon/collection-requests/:id/approve  — owner/manager approves
@@ -818,7 +1034,26 @@ router.patch('/collection-requests/:id/approve', saloonAuth, requireRole('owner'
     if (!creq) return res.status(404).json({ message: 'Request not found.' });
     if (creq.status !== 'pending') return res.status(400).json({ message: `Request is already ${creq.status}.` });
 
-    await processCollectionApproval(creq, req.saloon, req.staff);
+    // A staff member's request settles only the bills they made
+    const requester = await SaloonStaff.findById(creq.requestedBy).select('role').lean();
+    const staffScope = requester && !isManager(requester) ? creq.requestedBy : undefined;
+
+    const due = await livePending(req.saloon._id, creq.customer, staffScope);
+    if (due <= 0)
+      return res.status(400).json({ message: 'Nothing is pending for this customer any more. Reject this request instead.' });
+
+    const applied = await applyPayment({
+      saloonId: req.saloon._id, customerId: creq.customer,
+      amount: Math.min(creq.amount, due), staffScope
+    });
+
+    if (!creq.requestedAmount) creq.requestedAmount = creq.amount;
+    creq.amount = applied;          // record what was actually collected
+    creq.status = 'approved';
+    creq.reviewedBy = req.staff._id;
+    creq.reviewedByName = req.staff.name;
+    creq.reviewedAt = new Date();
+    await creq.save();
 
     logActivity(req, req.saloon, 'collection_request_approved', {
       entity: 'customer', entityId: creq.customer, entityName: creq.customerName,
@@ -826,7 +1061,7 @@ router.patch('/collection-requests/:id/approve', saloonAuth, requireRole('owner'
     });
 
     res.json({ message: `Approved ₹${creq.amount} collection from ${creq.customerName}.`, request: creq });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // PATCH /api/saloon/collection-requests/:id/reject  — owner/manager rejects
@@ -840,7 +1075,7 @@ router.patch('/collection-requests/:id/reject', saloonAuth, requireRole('owner',
     creq.reviewedBy = req.staff._id;
     creq.reviewedByName = req.staff.name;
     creq.reviewedAt = new Date();
-    creq.rejectReason = req.body.reason || '';
+    creq.rejectReason = String(req.body.reason || '').slice(0, 500);
     await creq.save();
 
     logActivity(req, req.saloon, 'collection_request_rejected', {
@@ -849,12 +1084,15 @@ router.patch('/collection-requests/:id/reject', saloonAuth, requireRole('owner',
     });
 
     res.json({ message: 'Request rejected.', request: creq });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
 // SERVICES
 // ════════════════════════════════════════════════════════════════════════════
+
+const SERVICE_FIELDS = ['name', 'category', 'price', 'duration', 'gender', 'description', 'sortOrder'];
+const pick = (obj, fields) => Object.fromEntries(fields.filter(f => obj[f] !== undefined).map(f => [f, obj[f]]));
 
 // GET /api/saloon/services
 router.get('/services', saloonAuth, async (req, res) => {
@@ -862,109 +1100,175 @@ router.get('/services', saloonAuth, async (req, res) => {
     const services = await SaloonService.find({ saloon: req.saloon._id, isActive: true })
       .sort({ category: 1, sortOrder: 1, name: 1 }).lean();
     res.json(services);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // POST /api/saloon/services
 router.post('/services', saloonAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
-    const { name, category, price, duration, gender, description } = req.body;
-    if (!name || price === undefined) return res.status(400).json({ message: 'name and price are required.' });
-    const service = await SaloonService.create({ saloon: req.saloon._id, name, category, price, duration, gender, description });
-    logActivity(req, req.saloon, 'service_create', { entity: 'service', entityId: service._id, entityName: name, details: { category, price } });
+    const data = pick(req.body, SERVICE_FIELDS);
+    if (!data.name || data.price === undefined || data.price === '')
+      return res.status(400).json({ message: 'name and price are required.' });
+    const service = await SaloonService.create({ ...data, saloon: req.saloon._id });
+    logActivity(req, req.saloon, 'service_create', { entity: 'service', entityId: service._id, entityName: service.name, details: { category: service.category, price: service.price } });
     res.status(201).json(service);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
-// PUT /api/saloon/services/:id
+// PUT /api/saloon/services/:id  — only service fields; the saloon can never be changed
 router.put('/services/:id', saloonAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
     const service = await SaloonService.findOneAndUpdate(
       { _id: req.params.id, saloon: req.saloon._id },
-      req.body,
+      { $set: pick(req.body, [...SERVICE_FIELDS, 'isActive']) },
       { new: true, runValidators: true }
     );
     if (!service) return res.status(404).json({ message: 'Service not found.' });
     logActivity(req, req.saloon, 'service_update', { entity: 'service', entityId: service._id, entityName: service.name });
     res.json(service);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // DELETE /api/saloon/services/:id
 router.delete('/services/:id', saloonAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
-    const svc = await SaloonService.findOne({ _id: req.params.id, saloon: req.saloon._id });
+    const svc = await SaloonService.findOneAndUpdate({ _id: req.params.id, saloon: req.saloon._id }, { isActive: false });
     if (!svc) return res.status(404).json({ message: 'Service not found.' });
-    await SaloonService.findByIdAndUpdate(req.params.id, { isActive: false });
-    logActivity(req, req.saloon, 'service_delete', { entity: 'service', entityId: req.params.id, entityName: svc.name });
+    logActivity(req, req.saloon, 'service_delete', { entity: 'service', entityId: svc._id, entityName: svc.name });
     res.json({ message: 'Service removed.' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
 // WORK ENTRIES (BILLS)
 // ════════════════════════════════════════════════════════════════════════════
 
+// Commission for one bill line at the staff member's rate.
+//   percent → % of the line's net, fixed → ₹ per unit, none → nothing
+function lineEarning(net, qty, type, value) {
+  if (type === 'none') return 0;
+  if (type === 'fixed') return value * qty;
+  return net * value / 100;
+}
+
+// Validates and normalises the services array of a bill. Returns { lines } or { error }.
+function parseServiceLines(raw) {
+  let services = raw;
+  if (typeof services === 'string') {
+    try { services = JSON.parse(services); } catch { return { error: 'Invalid services.' }; }
+  }
+  if (!Array.isArray(services) || services.length === 0) return { error: 'At least one service is required.' };
+  if (services.length > 50) return { error: 'Too many services on one bill.' };
+
+  const lines = [];
+  for (const s of services) {
+    const price = Number(s?.price), qty = s?.qty === undefined || s?.qty === '' ? 1 : Number(s.qty);
+    const discount = s?.discount === undefined || s?.discount === '' ? 0 : Number(s.discount);
+    const name = String(s?.serviceName || '').trim();
+    if (!name) return { error: 'Every service needs a name.' };
+    if (!Number.isFinite(price) || price < 0) return { error: `Invalid price for ${name}.` };
+    if (!Number.isInteger(qty) || qty < 1 || qty > 100) return { error: `Invalid quantity for ${name}.` };
+    if (!Number.isFinite(discount) || discount < 0 || discount > price * qty)
+      return { error: `Discount for ${name} must be between 0 and the line total.` };
+    lines.push({
+      service: s.service && isId(String(s.service)) ? s.service : undefined,
+      serviceName: name, category: s.category ? String(s.category) : undefined,
+      price, qty, discount
+    });
+  }
+  return { lines };
+}
+
 // POST /api/saloon/entries  — staff creates a new work entry / bill
 router.post('/entries', saloonAuth, uploadPhoto.single('customerPhoto'), async (req, res) => {
   try {
-    let body = req.body;
-    if (typeof body.services === 'string') {
-      try { body.services = JSON.parse(body.services); } catch { body.services = []; }
+    const body = req.body;
+    const { customerId, customerName: custNameOverride, paymentMode, paymentStatus, amountPaid, notes, serviceDate, waived } = body;
+    const customerPhone = body.customerPhone ? normPhone(body.customerPhone) : '';
+
+    const parsed = parseServiceLines(body.services);
+    if (parsed.error) return res.status(400).json({ message: parsed.error });
+
+    let when = new Date();
+    if (serviceDate) {
+      when = new Date(serviceDate);
+      if (isNaN(when)) return res.status(400).json({ message: 'Invalid service date.' });
     }
+    if (customerPhone && !isPhone(customerPhone))
+      return res.status(400).json({ message: 'Please enter a valid customer mobile number.' });
 
-    const { customerPhone, customerId, customerName: custNameOverride, services, paymentMode, paymentStatus, amountPaid, notes, serviceDate, waived } = body;
-
-    if (!services || !Array.isArray(services) || services.length === 0)
-      return res.status(400).json({ message: 'At least one service is required.' });
-
-    const billNumber = await nextBillNumber(req.saloon._id);
-
-    // Compute totals
-    let subtotal = 0, discountTotal = 0, staffEarningTotal = 0;
+    // Totals and commission
     const commType = req.staff.commissionType || req.saloon.settings?.commissionType || 'percent';
     const commVal  = req.staff.commissionValue ?? req.saloon.settings?.commissionValue ?? 50;
-
-    const serviceLines = services.map(s => {
-      const lineTotal = (s.price || 0) * (s.qty || 1);
-      const disc      = s.discount || 0;
-      const net       = lineTotal - disc;
-      const earning   = commType === 'percent' ? (net * commVal / 100) : commVal;
-      subtotal     += net;
-      discountTotal += disc;
-      staffEarningTotal += earning;
-      return { ...s, staffEarning: Math.round(earning) };
+    let subtotal = 0, discountTotal = 0;
+    const serviceLines = parsed.lines.map(s => {
+      const net = s.price * s.qty - s.discount;
+      subtotal += net;
+      discountTotal += s.discount;
+      return { ...s, staffEarning: lineEarning(net, s.qty, commType, commVal) };
     });
 
-    const taxPct     = req.saloon.settings?.taxPercent || 0;
-    const taxAmount  = Math.round(subtotal * taxPct / 100);
-    const grandTotal = subtotal + taxAmount;
+    const taxPct    = req.saloon.settings?.taxPercent || 0;
+    const taxAmount = Math.round(subtotal * taxPct / 100);
+    const grossTotal = Math.round(subtotal + taxAmount);
 
-    // Determine payment status
-    const pStatus = paymentStatus || 'paid';
-    const paid    = pStatus === 'pending' ? 0 : parseFloat(amountPaid ?? grandTotal);
-    const due     = Math.max(0, Math.round(grandTotal - paid));
+    // Payment. 'pending' = Pay Later (an upfront part-payment is honoured);
+    // 'paid' with less money = a partial bill, unless the balance is waived,
+    // in which case the waived part is a discount and revenue = cash received.
+    const wanted = ['paid', 'pending', 'partial'].includes(paymentStatus) ? paymentStatus : 'paid';
+    const paidIn = toNum(amountPaid);
+    if (paidIn !== undefined && (!Number.isFinite(paidIn) || paidIn < 0))
+      return res.status(400).json({ message: 'Amount paid must be a positive number.' });
 
-    // Auto-create or look up customer by phone
-    let resolvedCustomerId = customerId || null;
+    let paid = wanted === 'pending' ? (paidIn || 0) : (paidIn ?? grossTotal);
+    paid = Math.round(Math.min(paid, grossTotal));
+    const isWaived = (waived === true || waived === 'true') && wanted !== 'pending';
+    const waivedAmount = isWaived ? grossTotal - paid : 0;
+    const grandTotal = grossTotal - waivedAmount;
+    const due = Math.max(0, grandTotal - paid);
+    const status = due === 0 ? 'paid' : (paid > 0 ? 'partial' : 'pending');
+
+    // Any money received now needs its mode; a fully unpaid Pay Later bill is 'credit'
+    const mode = payModeOf(paymentMode);
+    if (paid > 0 && !mode) return res.status(400).json({ message: PAY_MODE_MSG });
+
+    // A waiver shrinks the bill, so commission shrinks with it
+    const scale = grossTotal > 0 ? grandTotal / grossTotal : 1;
+    serviceLines.forEach(l => { l.staffEarning = Math.round(l.staffEarning * scale); });
+    const staffEarningTotal = serviceLines.reduce((s, l) => s + l.staffEarning, 0);
+
+    // Resolve the customer: by phone (auto-created), or an existing id in this saloon
+    let resolvedCustomerId = null;
     let resolvedCustomerName = 'Walk-in';
+    let resolvedPhone = customerPhone;
 
-    if (customerPhone && customerPhone.trim()) {
-      let cust = await SaloonCustomer.findOne({ saloon: req.saloon._id, phone: customerPhone.trim() });
+    if (customerPhone) {
+      let cust = await SaloonCustomer.findOne({ saloon: req.saloon._id, phone: { $in: phoneVariants(customerPhone) } });
       if (!cust) {
-        const autoName = custNameOverride && custNameOverride.trim()
-          ? custNameOverride.trim()
+        const autoName = custNameOverride && String(custNameOverride).trim()
+          ? String(custNameOverride).trim().slice(0, 80)
           : await nextCustomerName(req.saloon._id);
         cust = await SaloonCustomer.create({
           saloon: req.saloon._id,
           name: autoName,
-          phone: customerPhone.trim(),
+          phone: customerPhone,
           firstVisitAt: new Date()
         });
       }
       resolvedCustomerId = cust._id;
       resolvedCustomerName = cust.name;
+    } else if (customerId) {
+      const cust = isId(String(customerId)) && await SaloonCustomer.findOne({ _id: customerId, saloon: req.saloon._id });
+      if (!cust) return res.status(404).json({ message: 'Customer not found.' });
+      resolvedCustomerId = cust._id;
+      resolvedCustomerName = cust.name;
+      resolvedPhone = cust.phone;
     }
+
+    if (due > 0 && !resolvedCustomerId)
+      return res.status(400).json({ message: 'Customer phone is required when part of the bill is unpaid.' });
+
+    const billNumber = await nextBillNumber(req.saloon._id);
 
     const entry = await SaloonWorkEntry.create({
       saloon:        req.saloon._id,
@@ -973,20 +1277,22 @@ router.post('/entries', saloonAuth, uploadPhoto.single('customerPhoto'), async (
       billNumber,
       customer:      resolvedCustomerId || undefined,
       customerName:  resolvedCustomerName,
-      customerPhone: customerPhone || '',
+      customerPhone: resolvedPhone || '',
       customerPhoto: req.file ? req.file.path : undefined,
       services:      serviceLines,
       subtotal:      Math.round(subtotal),
-      discountTotal,
+      discountTotal: discountTotal + waivedAmount,
+      waivedAmount,
       taxAmount,
-      grandTotal:    Math.round(grandTotal),
-      staffEarning:  pStatus === 'pending' ? 0 : Math.round(staffEarningTotal),
-      paymentMode:   pStatus === 'pending' ? 'credit' : (paymentMode || 'cash'),
-      paymentStatus: pStatus,
-      amountPaid:    Math.round(paid),
+      grandTotal,
+      // Pay Later commission is credited when the customer pays (see applyPayment)
+      staffEarning:  status === 'pending' ? 0 : staffEarningTotal,
+      paymentMode:   paid > 0 ? mode : 'credit',
+      paymentStatus: status,
+      amountPaid:    paid,
       amountDue:     due,
-      notes,
-      serviceDate:   serviceDate ? new Date(serviceDate) : new Date()
+      notes:         notes ? String(notes).slice(0, 1000) : undefined,
+      serviceDate:   when
     });
 
     // Update customer stats
@@ -995,49 +1301,45 @@ router.post('/entries', saloonAuth, uploadPhoto.single('customerPhoto'), async (
         $inc: { totalVisits: 1, totalSpent: grandTotal },
         $set: { lastVisitAt: new Date() }
       };
-      // If pending, add to pendingAmount
-      if (due > 0) custUpdate.$inc.pendingAmount = due;
+      if (req.file) custUpdate.$push = { photos: { url: req.file.path, workEntry: entry._id, takenAt: new Date() } };
       await SaloonCustomer.findByIdAndUpdate(resolvedCustomerId, custUpdate);
-    }
-
-    // Add photo to customer gallery
-    if (req.file && resolvedCustomerId) {
-      await SaloonCustomer.findByIdAndUpdate(resolvedCustomerId, {
-        $push: { photos: { url: req.file.path, workEntry: entry._id, takenAt: new Date() } }
-      });
+      if (due > 0) await syncCustomerPending(req.saloon._id, resolvedCustomerId);
     }
 
     logActivity(req, req.saloon, 'bill_create', {
       entity: 'bill', entityId: entry._id, entityName: entry.billNumber,
-      details: { grandTotal: entry.grandTotal, customerName: entry.customerName, paymentMode: entry.paymentMode, paymentStatus: pStatus }
+      details: { grandTotal: entry.grandTotal, customerName: entry.customerName, paymentMode: entry.paymentMode, paymentStatus: status, waivedAmount }
     });
     res.status(201).json(entry);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // GET /api/saloon/entries  — filtered list
 router.get('/entries', saloonAuth, async (req, res) => {
   try {
-    const { from, to, staffId, page = 1, limit = 50 } = req.query;
+    const { from, to, staffId } = req.query;
+    const { page, limit, skip } = pageParams(req.query, 50, 200);
+    const tz = tzOf(req.saloon);
     const q = { saloon: req.saloon._id };
 
     // Non-owner staff can only see their own entries
-    if (!['owner', 'manager'].includes(req.staff.role)) {
+    if (!isManager(req.staff)) {
       q.staff = req.staff._id;
     } else if (staffId) {
-      q.staff = staffId;
+      if (!isId(staffId)) return res.status(400).json({ message: 'Invalid staff id.' });
+      q.staff = oid(staffId);   // ObjectId — aggregate $match does not cast strings
     }
 
     if (from || to) {
+      const f = parseDay(from, tz), t = parseDay(to, tz, true);
+      if ((from && !f) || (to && !t)) return res.status(400).json({ message: 'Invalid date range.' });
       q.serviceDate = {};
-      if (from) q.serviceDate.$gte = new Date(from);
-      if (to)   { const d = new Date(to); d.setHours(23, 59, 59); q.serviceDate.$lte = d; }
+      if (f) q.serviceDate.$gte = f;
+      if (t) q.serviceDate.$lte = t;
     }
 
-    // Today range
-    const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
-    const todayEnd   = new Date(); todayEnd.setHours(23, 59, 59, 999);
-    const todayQ = { ...q, serviceDate: { $gte: todayStart, $lte: todayEnd } };
+    const today = todayRange(tz);
+    const todayQ = { ...q, serviceDate: { $gte: today.start, $lte: today.end } };
 
     // All-time query for this staff (no date filter) — for lifetime earning stat
     const allTimeQ = q.staff
@@ -1045,11 +1347,7 @@ router.get('/entries', saloonAuth, async (req, res) => {
       : { saloon: req.saloon._id };
 
     const [entries, total, summaryAgg, todayCount, allTimeAgg] = await Promise.all([
-      SaloonWorkEntry.find(q)
-        .sort({ serviceDate: -1 })
-        .skip((page - 1) * limit)
-        .limit(Number(limit))
-        .lean(),
+      SaloonWorkEntry.find(q).sort({ serviceDate: -1 }).skip(skip).limit(limit).lean(),
       SaloonWorkEntry.countDocuments(q),
       SaloonWorkEntry.aggregate([
         { $match: q },
@@ -1069,159 +1367,155 @@ router.get('/entries', saloonAuth, async (req, res) => {
     // settledEarning = total salary actually paid to this staff (from SaloonSalarySettlement)
     let settledEarning = 0;
     if (q.staff) {
-      const staffOid = new mongoose.Types.ObjectId(q.staff.toString());
       const [settledAgg] = await SaloonSalarySettlement.aggregate([
-        { $match: { saloon: req.saloon._id, staff: staffOid } },
+        { $match: { saloon: req.saloon._id, staff: oid(q.staff) } },
         { $group: { _id: null, total: { $sum: '$amountPaid' } } }
       ]);
       settledEarning = settledAgg?.total || 0;
     }
 
     const summary = summaryAgg[0] || { totalRevenue: 0, totalEarning: 0 };
+    delete summary._id;
     const allTimeEarning = allTimeAgg[0]?.totalEarning || 0;
-    res.json({ entries, total, page: Number(page), pages: Math.ceil(total / limit),
+    res.json({ entries, total, page, pages: Math.ceil(total / limit),
       summary: { ...summary, settledEarning, allTimeEarning, pendingEarning: Math.max(0, allTimeEarning - settledEarning), todayCount } });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // GET /api/saloon/entries/:id
 router.get('/entries/:id', saloonAuth, async (req, res) => {
   try {
-    const entry = await SaloonWorkEntry.findOne({ _id: req.params.id, saloon: req.saloon._id })
-      .populate('staff', 'name role avatar')
-      .lean();
+    const q = { _id: req.params.id, saloon: req.saloon._id };
+    if (!isManager(req.staff)) q.staff = req.staff._id;
+    const entry = await SaloonWorkEntry.findOne(q).populate('staff', 'name role avatar').lean();
     if (!entry) return res.status(404).json({ message: 'Entry not found.' });
     res.json(entry);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
-// PUT /api/saloon/entries/:id  (owner / manager can edit)
+// PUT /api/saloon/entries/:id  (owner / manager) — descriptive fields only. Money
+// fields stay consistent with customer balances and commission, so they change
+// only through billing and collection, never by direct edit.
 router.put('/entries/:id', saloonAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
+    const update = pick(req.body, ['customerName', 'notes', 'paymentMode', 'serviceDate']);
+    if (update.serviceDate !== undefined && isNaN(new Date(update.serviceDate)))
+      return res.status(400).json({ message: 'Invalid service date.' });
     const entry = await SaloonWorkEntry.findOneAndUpdate(
       { _id: req.params.id, saloon: req.saloon._id },
-      req.body,
+      { $set: update },
       { new: true, runValidators: true }
     );
     if (!entry) return res.status(404).json({ message: 'Entry not found.' });
+    logActivity(req, req.saloon, 'bill_update', { entity: 'bill', entityId: entry._id, entityName: entry.billNumber, details: update });
     res.json(entry);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
 // CUSTOMERS
 // ════════════════════════════════════════════════════════════════════════════
 
+// Name / phone search filter; a typed mobile also matches its normalised digits
+function customerSearch(term) {
+  const t = String(term || '').trim();
+  const or = [
+    { name:  { $regex: escapeRegex(t), $options: 'i' } },
+    { phone: { $regex: escapeRegex(t), $options: 'i' } }
+  ];
+  const digits = normPhone(t);
+  if (digits && digits !== t) or.push({ phone: { $regex: escapeRegex(digits) } });
+  return or;
+}
+
 // GET /api/saloon/customers?pending=true  — list, optionally filter pending only
 router.get('/customers', saloonAuth, async (req, res) => {
   try {
-    const { q, page = 1, limit = 30, pending } = req.query;
+    const { q, pending } = req.query;
+    const { page, limit, skip } = pageParams(req.query, 30);
     const filter = { saloon: req.saloon._id, isActive: true };
-    if (q) filter.$or = [
-      { name: { $regex: q, $options: 'i' } },
-      { phone: { $regex: q, $options: 'i' } }
-    ];
+    if (q) filter.$or = customerSearch(q);
     if (pending === 'true') filter.pendingAmount = { $gt: 0 };
     const [customers, total] = await Promise.all([
-      SaloonCustomer.find(filter).sort({ pendingAmount: -1, totalVisits: -1 }).skip((page - 1) * limit).limit(Number(limit)).lean(),
+      SaloonCustomer.find(filter).sort({ pendingAmount: -1, totalVisits: -1 }).skip(skip).limit(limit).lean(),
       SaloonCustomer.countDocuments(filter)
     ]);
-    res.json({ customers, total });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+    res.json({ customers, total, page });
+  } catch (err) { sendError(res, err); }
 });
 
-// POST /api/saloon/customers  — create with auto-name if name not provided
+// POST /api/saloon/customers  — create with auto-name
 router.post('/customers', saloonAuth, async (req, res) => {
   try {
-    const { phone, email, gender, birthdate, notes, preferredStaff } = req.body;
+    const { email, gender, birthdate, notes, preferredStaff } = req.body;
+    const phone = normPhone(req.body.phone);
     if (!phone) return res.status(400).json({ message: 'phone is required.' });
-    const existing = await SaloonCustomer.findOne({ saloon: req.saloon._id, phone: phone.trim() });
+    if (!isPhone(phone)) return res.status(400).json({ message: 'Please enter a valid mobile number.' });
+    if (email && !isEmail(email)) return res.status(400).json({ message: 'Please enter a valid email address.' });
+    const existing = await SaloonCustomer.findOne({ saloon: req.saloon._id, phone: { $in: phoneVariants(phone) } });
     if (existing) return res.status(409).json(existing);
     const autoName = await nextCustomerName(req.saloon._id);
     const customer = await SaloonCustomer.create({
       saloon: req.saloon._id,
-      name: autoName, phone: phone.trim(), email, gender, birthdate, notes, preferredStaff,
+      name: autoName, phone, email, gender, birthdate, notes,
+      preferredStaff: preferredStaff && isId(String(preferredStaff)) ? preferredStaff : undefined,
       firstVisitAt: new Date()
     });
     logActivity(req, req.saloon, 'customer_create', { entity: 'customer', entityId: customer._id, entityName: customer.name });
     res.status(201).json(customer);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // GET /api/saloon/customers/search?q=  — search by phone or name for bill creation
 router.get('/customers/search', saloonAuth, async (req, res) => {
   try {
-    const { phone, q } = req.query;
-    const filter = { saloon: req.saloon._id, isActive: true };
-    const term = q || phone;
-    if (term) {
-      filter.$or = [
-        { name:  { $regex: term.trim(), $options: 'i' } },
-        { phone: { $regex: term.trim(), $options: 'i' } }
-      ];
-    } else return res.json([]);
-    const customers = await SaloonCustomer.find(filter).limit(10).lean();
+    const term = req.query.q || req.query.phone;
+    if (!term || !String(term).trim()) return res.json([]);
+    const customers = await SaloonCustomer.find({ saloon: req.saloon._id, isActive: true, $or: customerSearch(term) })
+      .limit(10).lean();
     res.json(customers);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // POST /api/saloon/customers/:id/collect  — collect pending payment from customer
 router.post('/customers/:id/collect', saloonAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
-    const { amount, paymentMode, staffId, notes } = req.body;
-    const collectAmount = parseFloat(amount);
-    if (!collectAmount || collectAmount <= 0)
+    const { paymentMode, staffId } = req.body;
+    const collectAmount = toNum(req.body.amount);
+    if (!Number.isFinite(collectAmount) || collectAmount <= 0)
       return res.status(400).json({ message: 'amount is required and must be > 0.' });
+    if (!payModeOf(paymentMode)) return res.status(400).json({ message: PAY_MODE_MSG });
 
     const customer = await SaloonCustomer.findOne({ _id: req.params.id, saloon: req.saloon._id });
     if (!customer) return res.status(404).json({ message: 'Customer not found.' });
 
-    // Use live work-entry sum as source of truth (customer.pendingAmount can be stale)
-    const liveAgg = await SaloonWorkEntry.aggregate([
-      { $match: { saloon: req.saloon._id, customer: customer._id, paymentStatus: { $in: ['pending', 'partial'] }, amountDue: { $gt: 0 } } },
-      { $group: { _id: null, total: { $sum: '$amountDue' } } }
-    ]);
-    const livePending = liveAgg[0]?.total || 0;
-    if (livePending <= 0) return res.status(400).json({ message: 'No pending amount for this customer.' });
-
-    const toCollect = Math.min(collectAmount, livePending);
-
-    // Sync customer.pendingAmount with live value then deduct
-    customer.pendingAmount = Math.max(0, livePending - toCollect);
-    await customer.save();
-
-    // Update matching pending/partial bills — mark as paid (oldest first)
-    const pendingBills = await SaloonWorkEntry.find({
-      saloon: req.saloon._id, customer: customer._id, paymentStatus: { $in: ['pending', 'partial'] }, amountDue: { $gt: 0 }
-    }).sort({ serviceDate: 1 });
-
-    let remaining = toCollect;
-    for (const bill of pendingBills) {
-      if (remaining <= 0) break;
-      const toPay = Math.min(remaining, bill.amountDue);
-      bill.amountPaid = (bill.amountPaid || 0) + toPay;
-      bill.amountDue  = Math.max(0, bill.amountDue - toPay);
-      bill.paymentStatus = bill.amountDue === 0 ? 'paid' : 'partial';
-      if (bill.paymentStatus === 'paid' || bill.paymentStatus === 'partial') {
-        // Now credit staff earning for this bill
-        bill.staffEarning = bill.staffEarning || Math.round(bill.grandTotal * 0.4);
-      }
-      await bill.save();
-
-      // Add to staff earning if specified
-      if (staffId) {
-        await SaloonWorkEntry.updateOne({ _id: bill._id }, { staff: staffId });
-      }
-      remaining -= toPay;
+    // Optionally credit the collected bills to a specific staff member of this saloon
+    let creditStaffId;
+    if (staffId) {
+      const st = await findSaloonStaff(req.saloon._id, staffId);
+      if (!st) return res.status(400).json({ message: 'Selected staff member not found in this saloon.' });
+      creditStaffId = st._id;
     }
+
+    const due = await livePending(req.saloon._id, customer._id);
+    if (due <= 0) {
+      await syncCustomerPending(req.saloon._id, customer._id);
+      return res.status(400).json({ message: 'No pending amount for this customer.' });
+    }
+
+    const collected = await applyPayment({
+      saloonId: req.saloon._id, customerId: customer._id,
+      amount: Math.min(collectAmount, due), creditStaffId
+    });
+    const fresh = await SaloonCustomer.findById(customer._id).lean();
 
     logActivity(req, req.saloon, 'pending_collected', {
       entity: 'customer', entityId: customer._id, entityName: customer.name,
-      details: { collected: toCollect, paymentMode, remainingPending: customer.pendingAmount }
+      details: { collected, paymentMode: payModeOf(paymentMode), remainingPending: fresh.pendingAmount }
     });
 
-    res.json({ message: `Collected ₹${toCollect}`, customer, remainingPending: customer.pendingAmount });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+    res.json({ message: `Collected ₹${collected}`, customer: fresh, remainingPending: fresh.pendingAmount });
+  } catch (err) { sendError(res, err); }
 });
 
 // GET /api/saloon/customers/:id  (with visit history)
@@ -1232,7 +1526,7 @@ router.get('/customers/:id', saloonAuth, async (req, res) => {
     const history = await SaloonWorkEntry.find({ saloon: req.saloon._id, customer: customer._id })
       .sort({ serviceDate: -1 }).limit(20).lean();
     res.json({ customer, history });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1249,72 +1543,94 @@ function haversineDistance(lat1, lng1, lat2, lng2) {
     Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
+const validLat = v => Number.isFinite(v) && v >= -90 && v <= 90;
+const validLng = v => Number.isFinite(v) && v >= -180 && v <= 180;
 
 // POST /api/saloon/attendance/self-checkin  — any staff member (self check-in/out)
 router.post('/attendance/self-checkin', saloonAuth, async (req, res) => {
   try {
-    const { lat, lng, type = 'in' } = req.body; // type: 'in' | 'out'
+    const type = req.body.type === 'out' ? 'out' : 'in';
+    const lat = toNum(req.body.lat), lng = toNum(req.body.lng);
+    const hasCoords = validLat(lat) && validLng(lng);
     const saloon = req.saloon;
+    const tz = tzOf(saloon);
 
-    // Geofence check — only if shop location is configured
-    if (lat != null && lng != null && saloon.location?.lat && saloon.location?.lng) {
-      const dist = haversineDistance(Number(lat), Number(lng), saloon.location.lat, saloon.location.lng);
+    // Geofence — once the shop location is set, a location is mandatory
+    if (saloon.location?.lat != null && saloon.location?.lng != null) {
+      if (!hasCoords) {
+        return res.status(400).json({
+          code: 'LOCATION_REQUIRED',
+          message: `Turn on location to check ${type}. You must be at the shop.`
+        });
+      }
+      const dist = haversineDistance(lat, lng, saloon.location.lat, saloon.location.lng);
       const radius = saloon.location.radius || 50;
       if (dist > radius) {
         return res.status(400).json({
-          message: `You are ${Math.round(dist)}m away from the shop. You must be within ${radius}m to check ${type === 'out' ? 'out' : 'in'}.`,
+          message: `You are ${Math.round(dist)}m away from the shop. You must be within ${radius}m to check ${type}.`,
           distance: Math.round(dist),
           required: radius
         });
       }
     }
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const today = dateKey(tz);
     const now = new Date();
-    const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    const timeStr = hhmm(tz, now);
+    const filter = { saloon: saloon._id, staff: req.staff._id, date: today };
 
-    let update;
+    let record;
     if (type === 'out') {
-      update = { $set: { checkOut: timeStr, checkoutAt: now, checkoutLat: lat, checkoutLng: lng } };
+      const existing = await SaloonAttendance.findOne(filter);
+      if (!existing?.checkIn) return res.status(400).json({ message: 'Please check in first.' });
+      existing.set({ checkOut: timeStr, checkoutAt: now, checkoutLat: hasCoords ? lat : undefined, checkoutLng: hasCoords ? lng : undefined });
+      record = await existing.save();
     } else {
-      update = { $set: { status: 'present', selfCheckedIn: true, checkinAt: now, checkIn: timeStr, checkinLat: lat, checkinLng: lng } };
+      record = await SaloonAttendance.findOneAndUpdate(filter,
+        { $set: { status: 'present', selfCheckedIn: true, checkinAt: now, checkIn: timeStr,
+                  checkinLat: hasCoords ? lat : undefined, checkinLng: hasCoords ? lng : undefined } },
+        { upsert: true, new: true, runValidators: true });
     }
-
-    const record = await SaloonAttendance.findOneAndUpdate(
-      { saloon: req.saloon._id, staff: req.staff._id, date: today },
-      update,
-      { upsert: true, new: true, runValidators: true }
-    );
     res.json({ record, type, time: timeStr });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // GET /api/saloon/attendance/my-today  — get my attendance for today
 router.get('/attendance/my-today', saloonAuth, async (req, res) => {
   try {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
     const record = await SaloonAttendance.findOne({
-      saloon: req.saloon._id, staff: req.staff._id, date: today
+      saloon: req.saloon._id, staff: req.staff._id, date: dateKey(tzOf(req.saloon))
     }).lean();
     res.json(record || null);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // PATCH /api/saloon/settings/location  — save shop GPS location (owner/manager)
 router.patch('/settings/location', saloonAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
-    const { lat, lng, radius } = req.body;
-    if (lat == null || lng == null) return res.status(400).json({ message: 'lat and lng required.' });
+    const lat = toNum(req.body.lat), lng = toNum(req.body.lng);
+    const radius = toNum(req.body.radius) ?? 50;
+    if (!validLat(lat) || !validLng(lng)) return res.status(400).json({ message: 'Valid lat and lng required.' });
+    if (!Number.isFinite(radius) || radius < 10 || radius > 5000)
+      return res.status(400).json({ message: 'Radius must be between 10 and 5000 metres.' });
     const updated = await SaloonBusiness.findByIdAndUpdate(
       req.saloon._id,
-      { $set: { 'location.lat': Number(lat), 'location.lng': Number(lng), 'location.radius': Number(radius) || 50 } },
+      { $set: { 'location.lat': lat, 'location.lng': lng, 'location.radius': radius } },
       { new: true }
     );
+    logActivity(req, req.saloon, 'settings_update', { entity: 'business', entityId: req.saloon._id, details: { location: true } });
     res.json({ location: updated.location });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
+
+// Attendance dates are UTC-midnight keys, so ranges are plain UTC calendar ranges
+function monthKeyRange(month) {
+  const m = /^(\d{4})-(\d{2})$/.exec(String(month || ''));
+  if (!m) return null;
+  const y = +m[1], mo = +m[2];
+  if (mo < 1 || mo > 12) return null;
+  return { $gte: new Date(Date.UTC(y, mo - 1, 1)), $lt: new Date(Date.UTC(y, mo, 1)) };
+}
 
 // GET /api/saloon/attendance?month=YYYY-MM&staffId=...
 // Staff can view their own attendance; managers/owners can view any
@@ -1322,23 +1638,22 @@ router.get('/attendance', saloonAuth, async (req, res) => {
   try {
     const { month, staffId } = req.query;
     const q = { saloon: req.saloon._id };
-    
-    // Determine which staff to query
-    let queryStaffId = staffId || req.staff._id.toString();
-    
-    // Staff can only view their own; managers/owners can view any
-    if (!['owner', 'manager'].includes(req.staff.role) && queryStaffId !== req.staff._id.toString()) {
+
+    const queryStaffId = staffId || req.staff._id.toString();
+    if (!isId(queryStaffId)) return res.status(400).json({ message: 'Invalid staff id.' });
+    if (!isManager(req.staff) && queryStaffId !== req.staff._id.toString()) {
       return res.status(403).json({ message: 'Access denied. Can only view your own attendance.' });
     }
-    
-    if (queryStaffId) q.staff = queryStaffId;
+    q.staff = queryStaffId;
+
     if (month) {
-      const [y, m] = month.split('-').map(Number);
-      q.date = { $gte: new Date(y, m - 1, 1), $lte: new Date(y, m, 0, 23, 59, 59) };
+      const range = monthKeyRange(month);
+      if (!range) return res.status(400).json({ message: 'month must be YYYY-MM.' });
+      q.date = range;
     }
     const records = await SaloonAttendance.find(q).populate('staff', 'name role avatar').sort({ date: -1 }).lean();
     res.json(records);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // POST /api/saloon/attendance
@@ -1346,14 +1661,27 @@ router.post('/attendance', saloonAuth, requireRole('owner', 'manager'), async (r
   try {
     const { staffId, date, status, checkIn, checkOut, note } = req.body;
     if (!staffId || !date) return res.status(400).json({ message: 'staffId and date required.' });
+    const staff = await findSaloonStaff(req.saloon._id, staffId);
+    if (!staff) return res.status(404).json({ message: 'Staff not found.' });
+
+    // 'YYYY-MM-DD' is already the key; anything else is converted in the saloon's timezone
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date));
+    const day = m ? new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])) : (isNaN(new Date(date)) ? null : dateKey(tzOf(req.saloon), new Date(date)));
+    if (!day || isNaN(day)) return res.status(400).json({ message: 'Invalid date.' });
+
+    const set = { status: status || 'present' };
+    if (checkIn !== undefined)  set.checkIn = checkIn;
+    if (checkOut !== undefined) set.checkOut = checkOut;
+    if (note !== undefined)     set.note = String(note).slice(0, 500);
+
     const record = await SaloonAttendance.findOneAndUpdate(
-      { saloon: req.saloon._id, staff: staffId, date: new Date(date) },
-      { status: status || 'present', checkIn, checkOut, note },
+      { saloon: req.saloon._id, staff: staff._id, date: day },
+      { $set: set },
       { upsert: true, new: true, runValidators: true }
     );
-    logActivity(req, req.saloon, 'attendance_mark', { entity: 'attendance', entityId: staffId, details: { date, status: status || 'present' } });
+    logActivity(req, req.saloon, 'attendance_mark', { entity: 'attendance', entityId: staff._id, entityName: staff.name, details: { date, status: set.status } });
     res.json(record);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1364,14 +1692,11 @@ router.post('/attendance', saloonAuth, requireRole('owner', 'manager'), async (r
 router.get('/dashboard', saloonAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
     const saloonId = req.saloon._id;
+    const tz = tzOf(req.saloon);
     const billsPage  = Math.max(1, parseInt(req.query.billsPage)  || 1);
     const billsLimit = Math.min(50, Math.max(1, parseInt(req.query.billsLimit) || 10));
-    const today = new Date(); today.setHours(0, 0, 0, 0);
-    const todayEnd = new Date(); todayEnd.setHours(23, 59, 59, 999);
-
-    // This month
-    const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
-    const monthEnd   = new Date(today.getFullYear(), today.getMonth() + 1, 0, 23, 59, 59);
+    const today = todayRange(tz);
+    const month = monthRange(tz);
 
     const [
       todayEntries,
@@ -1383,11 +1708,11 @@ router.get('/dashboard', saloonAuth, requireRole('owner', 'manager'), async (req
       pendingAgg
     ] = await Promise.all([
       SaloonWorkEntry.aggregate([
-        { $match: { saloon: saloonId, serviceDate: { $gte: today, $lte: todayEnd } } },
+        { $match: { saloon: saloonId, serviceDate: { $gte: today.start, $lte: today.end } } },
         { $group: { _id: null, revenue: { $sum: '$grandTotal' }, count: { $sum: 1 }, staffEarning: { $sum: '$staffEarning' } } }
       ]),
       SaloonWorkEntry.aggregate([
-        { $match: { saloon: saloonId, serviceDate: { $gte: monthStart, $lte: monthEnd } } },
+        { $match: { saloon: saloonId, serviceDate: { $gte: month.start, $lte: month.end } } },
         { $group: { _id: null, revenue: { $sum: '$grandTotal' }, count: { $sum: 1 }, staffEarning: { $sum: '$staffEarning' } } }
       ]),
       SaloonCustomer.countDocuments({ saloon: saloonId, isActive: true }),
@@ -1406,14 +1731,14 @@ router.get('/dashboard', saloonAuth, requireRole('owner', 'manager'), async (req
 
     // Staff performance this month
     const staffPerf = await SaloonWorkEntry.aggregate([
-      { $match: { saloon: saloonId, serviceDate: { $gte: monthStart, $lte: monthEnd } } },
+      { $match: { saloon: saloonId, serviceDate: { $gte: month.start, $lte: month.end } } },
       { $group: { _id: '$staff', name: { $first: '$staffName' }, bills: { $sum: 1 }, revenue: { $sum: '$grandTotal' }, earning: { $sum: '$staffEarning' } } },
       { $sort: { revenue: -1 } }
     ]);
 
     // Owner's own earning (bills where owner themselves is the staff)
     const ownerEarnAgg = await SaloonWorkEntry.aggregate([
-      { $match: { saloon: saloonId, staff: req.staff._id, serviceDate: { $gte: monthStart, $lte: monthEnd } } },
+      { $match: { saloon: saloonId, staff: req.staff._id, serviceDate: { $gte: month.start, $lte: month.end } } },
       { $group: { _id: null, earning: { $sum: '$staffEarning' }, bills: { $sum: 1 }, revenue: { $sum: '$grandTotal' } } }
     ]);
     const ownerEarn = ownerEarnAgg[0] || { earning: 0, bills: 0, revenue: 0 };
@@ -1434,18 +1759,21 @@ router.get('/dashboard', saloonAuth, requireRole('owner', 'manager'), async (req
       pendingPayments: pendingAgg[0] || { total: 0, count: 0 },
       ownerEarn
     });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // GET /api/saloon/reports/staff  — per-staff earnings report
 router.get('/reports/staff', saloonAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
     const { from, to } = req.query;
+    const tz = tzOf(req.saloon);
     const match = { saloon: req.saloon._id };
     if (from || to) {
+      const f = parseDay(from, tz), t = parseDay(to, tz, true);
+      if ((from && !f) || (to && !t)) return res.status(400).json({ message: 'Invalid date range.' });
       match.serviceDate = {};
-      if (from) match.serviceDate.$gte = new Date(from);
-      if (to) { const d = new Date(to); d.setHours(23, 59, 59); match.serviceDate.$lte = d; }
+      if (f) match.serviceDate.$gte = f;
+      if (t) match.serviceDate.$lte = t;
     }
     const data = await SaloonWorkEntry.aggregate([
       { $match: match },
@@ -1453,7 +1781,7 @@ router.get('/reports/staff', saloonAuth, requireRole('owner', 'manager'), async 
       { $sort: { revenue: -1 } }
     ]);
     res.json(data);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // GET /api/saloon/salary/staff-summary — all staff with period earnings + pending amount
@@ -1461,12 +1789,12 @@ router.get('/salary/staff-summary', saloonAuth, requireRole('owner', 'manager'),
   try {
     const { from, to } = req.query;
     const saloonId = req.saloon._id;
+    const tz = tzOf(req.saloon);
 
-    const fromDate = from ? new Date(from) : new Date(new Date().getFullYear(), new Date().getMonth(), 1);
-    const toDate   = to   ? new Date(to)   : new Date();
-    toDate.setHours(23, 59, 59, 999);
+    const fromDate = parseDay(from, tz) || monthRange(tz).start;
+    const toDate   = parseDay(to, tz, true) || todayRange(tz).end;
 
-    const [staffList, earningsAgg, settledAgg] = await Promise.all([
+    const [staffList, earningsAgg, settledAgg, allTimeEarnAgg] = await Promise.all([
       SaloonStaff.find({ saloon: saloonId })
         .select('name phone role salary commissionType commissionValue joiningDate isActive avatar designation')
         .sort({ name: 1 })
@@ -1480,11 +1808,7 @@ router.get('/salary/staff-summary', saloonAuth, requireRole('owner', 'manager'),
       SaloonSalarySettlement.aggregate([
         { $match: { saloon: saloonId } },
         { $group: { _id: '$staff', totalPaid: { $sum: '$amountPaid' }, lastSettledAt: { $max: '$settledAt' }, settlementsCount: { $sum: 1 } } }
-      ])
-    ]);
-
-    // Also get total ever earned (for pending calc)
-    const [allTimeEarnAgg] = await Promise.all([
+      ]),
       SaloonWorkEntry.aggregate([
         { $match: { saloon: saloonId } },
         { $group: { _id: '$staff', totalEarned: { $sum: '$staffEarning' } } }
@@ -1518,7 +1842,7 @@ router.get('/salary/staff-summary', saloonAuth, requireRole('owner', 'manager'),
     });
 
     res.json({ staff: result, fromDate, toDate });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1531,19 +1855,63 @@ router.get('/settings', saloonAuth, requireRole('owner', 'manager'), async (req,
     await ensureSaloonCode(req.saloon._id);
     const saloon = await SaloonBusiness.findById(req.saloon._id).select('-password -token').lean();
     res.json(saloon);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
-// PUT /api/saloon/settings
+const SETTINGS_KEYS = ['currency', 'currencySymbol', 'timezone', 'commissionType', 'commissionValue', 'taxPercent', 'appointmentSlotMinutes'];
+const ADDRESS_KEYS  = ['street', 'city', 'state', 'pincode'];
+
+// PUT /api/saloon/settings — nested settings/address are merged key by key,
+// so sending { settings: { taxPercent } } no longer wipes the other settings.
 router.put('/settings', saloonAuth, requireRole('owner'), async (req, res) => {
   try {
-    const allowed = ['businessName', 'ownerName', 'phone', 'businessType', 'address', 'gstin', 'hours', 'settings'];
-    const update = {};
-    allowed.forEach(k => { if (req.body[k] !== undefined) update[k] = req.body[k]; });
-    const saloon = await SaloonBusiness.findByIdAndUpdate(req.saloon._id, update, { new: true }).select('-password -token');
+    const b = req.body || {};
+    const $set = {};
+    ['businessName', 'ownerName', 'businessType', 'gstin', 'hours'].forEach(k => {
+      if (b[k] !== undefined) $set[k] = typeof b[k] === 'string' ? b[k].trim() : b[k];
+    });
+    if ($set.businessName === '' || $set.ownerName === '')
+      return res.status(400).json({ message: 'Business name and owner name cannot be empty.' });
+
+    if (b.settings && typeof b.settings === 'object') {
+      const s = b.settings;
+      for (const k of SETTINGS_KEYS) if (s[k] !== undefined) $set[`settings.${k}`] = s[k];
+      const tax = toNum(s.taxPercent), comm = toNum(s.commissionValue);
+      if (tax !== undefined && !(Number.isFinite(tax) && tax >= 0 && tax <= 100))
+        return res.status(400).json({ message: 'Tax must be between 0 and 100%.' });
+      if (comm !== undefined && !(Number.isFinite(comm) && comm >= 0 && (s.commissionType !== 'percent' || comm <= 100)))
+        return res.status(400).json({ message: 'Commission must be 0–100% (or a positive fixed amount).' });
+      if (s.timezone !== undefined && safeTz(s.timezone) !== s.timezone)
+        return res.status(400).json({ message: 'Unknown timezone.' });
+    }
+    if (b.address && typeof b.address === 'object') {
+      for (const k of ADDRESS_KEYS) if (b.address[k] !== undefined) $set[`address.${k}`] = String(b.address[k]).trim();
+    }
+
+    // The phone is the saloon's platform-wide identity and the owner's login
+    let newPhone;
+    if (b.phone !== undefined) {
+      newPhone = normPhone(b.phone);
+      if (!isPhone(newPhone)) return res.status(400).json({ message: 'Please enter a valid mobile number.' });
+      if (await SaloonBusiness.exists({ _id: { $ne: req.saloon._id }, phone: { $in: phoneVariants(newPhone) } }))
+        return res.status(409).json({ message: 'Another saloon already uses this mobile number.' });
+      if (await SaloonStaff.exists({ saloon: req.saloon._id, role: { $ne: 'owner' }, phone: { $in: phoneVariants(newPhone) } }))
+        return res.status(409).json({ message: 'A staff member in this saloon already uses this mobile number.' });
+      $set.phone = newPhone;
+    }
+
+    const saloon = await SaloonBusiness.findByIdAndUpdate(req.saloon._id, { $set }, { new: true, runValidators: true });
+
+    // Keep the owner's login record in step with the business record
+    const ownerSet = {};
+    if (newPhone) ownerSet.phone = newPhone;
+    if ($set.ownerName) ownerSet.name = $set.ownerName;
+    if (Object.keys(ownerSet).length)
+      await SaloonStaff.updateOne({ saloon: req.saloon._id, role: 'owner' }, { $set: ownerSet });
+
     logActivity(req, saloon, 'settings_update', { entity: 'business', entityId: saloon._id });
-    res.json(saloon.toSafeObject ? saloon.toSafeObject() : saloon);
-  } catch (err) { res.status(500).json({ message: err.message }); }
+    res.json(saloon.toSafeObject());
+  } catch (err) { sendError(res, err); }
 });
 
 // POST /api/saloon/settings/logo
@@ -1552,122 +1920,83 @@ router.post('/settings/logo', saloonAuth, requireRole('owner'), uploadPhoto.sing
     if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
     const saloon = await SaloonBusiness.findByIdAndUpdate(req.saloon._id, { logo: req.file.path }, { new: true });
     res.json({ logo: saloon.logo });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
+// ════════════════════════════════════════════════════════════════════════════
 // SALARY SETTLEMENT
 // ════════════════════════════════════════════════════════════════════════════
+
+// Earnings since the last settlement (or joining date) for one staff member
+async function unsettledPeriod(saloonId, staff) {
+  const last = await SaloonSalarySettlement.findOne({ saloon: saloonId, staff: staff._id }).sort({ settledAt: -1 }).lean();
+  const periodFrom = last ? new Date(last.settledAt) : (staff.joiningDate || new Date(0));
+  const periodTo = new Date();
+  const [agg] = await SaloonWorkEntry.aggregate([
+    { $match: { saloon: saloonId, staff: staff._id, serviceDate: { $gte: periodFrom, $lte: periodTo } } },
+    { $group: { _id: null, bills: { $sum: 1 }, revenue: { $sum: '$grandTotal' }, earning: { $sum: '$staffEarning' } } }
+  ]);
+  return { periodFrom, periodTo, pending: agg ? { bills: agg.bills, revenue: agg.revenue, earning: agg.earning } : { bills: 0, revenue: 0, earning: 0 } };
+}
 
 // GET /api/saloon/salary/settlements?staffId=  — pending earning + settlement history
 router.get('/salary/settlements', saloonAuth, requireRole('owner', 'manager'), async (req, res) => {
   try {
     const { staffId } = req.query;
     if (!staffId) return res.status(400).json({ message: 'staffId required.' });
-    const saloonId = req.saloon._id;
+    const staff = await findSaloonStaff(req.saloon._id, staffId);
+    if (!staff) return res.status(404).json({ message: 'Staff not found.' });
 
-    // All past settlements (most recent first)
     const settlements = await SaloonSalarySettlement
-      .find({ saloon: saloonId, staff: staffId })
+      .find({ saloon: req.saloon._id, staff: staff._id })
       .sort({ settledAt: -1 })
       .limit(30)
       .lean();
+    const { periodFrom, periodTo, pending } = await unsettledPeriod(req.saloon._id, staff);
 
-    // Period start = last settlement date (or joining date)
-    const lastSettlement = settlements[0];
-    let periodFrom;
-    if (lastSettlement) {
-      periodFrom = new Date(lastSettlement.settledAt);
-    } else {
-      const staffDoc = await SaloonStaff.findById(staffId).select('joiningDate').lean();
-      periodFrom = staffDoc?.joiningDate || new Date(0);
-    }
-
-    const periodTo = new Date();
-    periodTo.setHours(23, 59, 59, 999);
-
-    const matchPending = {
-      saloon: saloonId,
-      staff:  new mongoose.Types.ObjectId(staffId),
-      serviceDate: { $gte: periodFrom, $lte: periodTo }
-    };
-
-    const [pending] = await SaloonWorkEntry.aggregate([
-      { $match: matchPending },
-      { $group: { _id: null, bills: { $sum: 1 }, revenue: { $sum: '$grandTotal' }, earning: { $sum: '$staffEarning' } } }
-    ]);
-
-    res.json({
-      settlements,
-      pending: pending || { bills: 0, revenue: 0, earning: 0 },
-      periodFrom,
-      periodTo
-    });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+    res.json({ settlements, pending, periodFrom, periodTo });
+  } catch (err) { sendError(res, err); }
 });
 
 // POST /api/saloon/salary/settle  — create a settlement record
 router.post('/salary/settle', saloonAuth, requireRole('owner'), async (req, res) => {
   try {
-    const { staffId, amountPaid, paymentMode, notes } = req.body;
+    const { staffId, paymentMode, notes } = req.body;
+    const amountPaid = toNum(req.body.amountPaid);
     if (!staffId || amountPaid === undefined)
       return res.status(400).json({ message: 'staffId and amountPaid are required.' });
-    if (Number(amountPaid) < 0)
-      return res.status(400).json({ message: 'amountPaid cannot be negative.' });
+    if (!Number.isFinite(amountPaid) || amountPaid < 0)
+      return res.status(400).json({ message: 'amountPaid must be a number of 0 or more.' });
+    if (!payModeOf(paymentMode)) return res.status(400).json({ message: PAY_MODE_MSG });
 
-    const saloonId = req.saloon._id;
+    const staff = await findSaloonStaff(req.saloon._id, staffId);
+    if (!staff) return res.status(404).json({ message: 'Staff not found.' });
 
-    // Determine period start
-    const lastSettlement = await SaloonSalarySettlement
-      .findOne({ saloon: saloonId, staff: staffId })
-      .sort({ settledAt: -1 })
-      .lean();
-
-    let periodFrom;
-    if (lastSettlement) {
-      periodFrom = new Date(lastSettlement.settledAt);
-    } else {
-      const staffDoc = await SaloonStaff.findById(staffId).select('joiningDate').lean();
-      periodFrom = staffDoc?.joiningDate || new Date(0);
-    }
-
-    const periodTo = new Date();
-    periodTo.setHours(23, 59, 59, 999);
-
-    // Aggregate earnings for this period
-    const [agg] = await SaloonWorkEntry.aggregate([
-      { $match: {
-          saloon: saloonId,
-          staff:  new mongoose.Types.ObjectId(staffId),
-          serviceDate: { $gte: periodFrom, $lte: periodTo }
-      }},
-      { $group: { _id: null, bills: { $sum: 1 }, revenue: { $sum: '$grandTotal' }, earning: { $sum: '$staffEarning' } } }
-    ]);
-
-    const staffDoc = await SaloonStaff.findById(staffId).select('name phone').lean();
+    const { periodFrom, periodTo, pending } = await unsettledPeriod(req.saloon._id, staff);
 
     const settlement = await SaloonSalarySettlement.create({
-      saloon:       saloonId,
-      staff:        staffId,
-      staffName:    staffDoc?.name || 'Unknown',
+      saloon:       req.saloon._id,
+      staff:        staff._id,
+      staffName:    staff.name,
       periodFrom,
       periodTo,
-      totalBills:   agg?.bills   || 0,
-      totalRevenue: agg?.revenue || 0,
-      grossEarning: agg?.earning || 0,
-      amountPaid:   Number(amountPaid),
-      paymentMode:  paymentMode || 'cash',
-      notes:        notes || '',
+      totalBills:   pending.bills,
+      totalRevenue: pending.revenue,
+      grossEarning: pending.earning,
+      amountPaid,
+      paymentMode:  payModeOf(paymentMode),
+      notes:        notes ? String(notes).slice(0, 500) : '',
       paidBy:       req.staff?.name || req.saloon?.ownerName || '',
-      staffPhone:   staffDoc?.phone || ''
+      staffPhone:   staff.phone || ''
     });
 
     logActivity(req, req.saloon, 'salary_settled', {
-      entity: 'staff', entityId: staffId, entityName: staffDoc?.name,
-      details: { amountPaid, paymentMode }
+      entity: 'staff', entityId: staff._id, entityName: staff.name,
+      details: { amountPaid, paymentMode: settlement.paymentMode }
     });
 
-    res.json({ settlement, staffPhone: staffDoc?.phone || '' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+    res.json({ settlement, staffPhone: staff.phone || '' });
+  } catch (err) { sendError(res, err); }
 });
 
 // GET /api/saloon/salary/my-settlements  — staff views own settlement history + unsettled earning
@@ -1676,36 +2005,23 @@ router.get('/salary/my-settlements', saloonAuth, async (req, res) => {
     const staffId  = req.staff._id;
     const saloonId = req.saloon._id;
 
-    const settlements = await SaloonSalarySettlement
-      .find({ saloon: saloonId, staff: staffId })
-      .sort({ settledAt: -1 }).limit(50).lean();
-
-    // Period since last settlement
-    const lastSettlement = settlements[0];
-    const periodFrom = lastSettlement
-      ? new Date(lastSettlement.settledAt)
-      : ((await SaloonStaff.findById(staffId).select('joiningDate').lean())?.joiningDate || new Date(0));
-    const periodTo = new Date(); periodTo.setHours(23, 59, 59, 999);
-
-    const [unsettled] = await SaloonWorkEntry.aggregate([
-      { $match: { saloon: saloonId, staff: staffId, serviceDate: { $gte: periodFrom, $lte: periodTo } } },
-      { $group: { _id: null, bills: { $sum: 1 }, revenue: { $sum: '$grandTotal' }, earning: { $sum: '$staffEarning' } } }
-    ]);
-
-    // Total paid since ever
-    const [totalPaid] = await SaloonSalarySettlement.aggregate([
-      { $match: { saloon: saloonId, staff: staffId } },
-      { $group: { _id: null, total: { $sum: '$amountPaid' } } }
+    const [settlements, period, totalPaid] = await Promise.all([
+      SaloonSalarySettlement.find({ saloon: saloonId, staff: staffId }).sort({ settledAt: -1 }).limit(50).lean(),
+      unsettledPeriod(saloonId, req.staff),
+      SaloonSalarySettlement.aggregate([
+        { $match: { saloon: saloonId, staff: staffId } },
+        { $group: { _id: null, total: { $sum: '$amountPaid' } } }
+      ])
     ]);
 
     res.json({
       settlements,
-      unsettled: unsettled || { bills: 0, revenue: 0, earning: 0 },
-      totalPaidEver: totalPaid?.total || 0,
-      periodFrom,
-      periodTo
+      unsettled: period.pending,
+      totalPaidEver: totalPaid[0]?.total || 0,
+      periodFrom: period.periodFrom,
+      periodTo: period.periodTo
     });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { sendError(res, err); }
 });
 
 module.exports = router;
