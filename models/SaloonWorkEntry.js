@@ -31,6 +31,7 @@ const saloonWorkEntrySchema = new Schema({
   // Totals
   subtotal:      { type: Number, default: 0 },
   discountTotal: { type: Number, default: 0 },
+  waivedAmount:  { type: Number, default: 0 },   // balance forgiven at billing, included in discountTotal
   taxAmount:     { type: Number, default: 0 },
   grandTotal:    { type: Number, default: 0 },
   staffEarning:  { type: Number, default: 0 },  // total commission for this bill
