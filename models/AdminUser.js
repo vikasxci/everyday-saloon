@@ -7,12 +7,15 @@ const adminUserSchema = new mongoose.Schema({
   password: { type: String, required: true },
   role:     { type: String, enum: ['superadmin', 'support'], default: 'superadmin' },
   isActive: { type: Boolean, default: true },
-  lastLogin:{ type: Date }
+  lastLogin:{ type: Date },
+  // Bumped on every password change; tokens carrying an older version are rejected
+  tokenVersion: { type: Number, default: 0 }
 }, { timestamps: true });
 
 adminUserSchema.pre('save', async function (next) {
   if (!this.isModified('password')) return next();
   this.password = await bcrypt.hash(this.password, 12);
+  if (!this.isNew) this.tokenVersion = (this.tokenVersion || 0) + 1;
   next();
 });
 
