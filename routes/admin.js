@@ -741,7 +741,7 @@ router.get('/config', adminAuth, async (req, res) => {
 
 router.patch('/config', adminAuth, requireSuper, async (req, res) => {
   try {
-    const allowed = ['globalServiceMode', 'serviceModeMessage', 'defaultTrialDays', 'defaultMonthlyRate'];
+    const allowed = ['globalServiceMode', 'serviceModeMessage', 'defaultTrialDays', 'defaultMonthlyRate', 'appDownloadUrl', 'appDownloadEnabled'];
     const update  = {};
     for (const k of allowed) {
       if (req.body[k] !== undefined) update[k] = req.body[k];
@@ -753,6 +753,15 @@ router.patch('/config', adminAuth, requireSuper, async (req, res) => {
       if (!Number.isInteger(d) || d < 1 || d > 365) return res.status(400).json({ message: 'Trial days must be a whole number from 1 to 365.' });
       update.defaultTrialDays = d;
     }
+    if (update.appDownloadUrl !== undefined) {
+      const url = String(update.appDownloadUrl || '').trim();
+      // https only — this link is handed to every visitor of the web app
+      let ok = url === '';
+      try { ok = ok || (url.length <= 500 && new URL(url).protocol === 'https:'); } catch { ok = false; }
+      if (!ok) return res.status(400).json({ message: 'Download link must be a full https:// address (or empty to use the default).' });
+      update.appDownloadUrl = url;
+    }
+    if (update.appDownloadEnabled !== undefined) update.appDownloadEnabled = update.appDownloadEnabled === true || update.appDownloadEnabled === 'true';
     if (update.defaultMonthlyRate !== undefined) {
       const r = Number(update.defaultMonthlyRate);
       if (!Number.isFinite(r) || r < 0) return res.status(400).json({ message: 'Monthly rate must be a number of 0 or more.' });
