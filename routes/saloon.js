@@ -243,6 +243,16 @@ function staffChangeError(actor, target, body = {}) {
   return null;
 }
 
+// GET /api/saloon/app-info — public: the "Download App" link, set by the admin panel.
+// downloadUrl '' means "use the link built into the web app".
+router.get('/app-info', async (req, res) => {
+  try {
+    const cfg = await AppConfig.findOne({ key: 'global' }).select('appDownloadUrl appDownloadEnabled').lean();
+    res.set('Cache-Control', 'public, max-age=60');
+    res.json({ downloadUrl: cfg?.appDownloadUrl || '', downloadEnabled: cfg?.appDownloadEnabled !== false });
+  } catch (err) { sendError(res, err); }
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // AUTH
 // ════════════════════════════════════════════════════════════════════════════
@@ -1842,6 +1852,145 @@ router.get('/salary/staff-summary', saloonAuth, requireRole('owner', 'manager'),
     });
 
     res.json({ staff: result, fromDate, toDate });
+  } catch (err) { sendError(res, err); }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// ANALYTICS  (owner) — everything for one period in a single response
+// ════════════════════════════════════════════════════════════════════════════
+
+// Headline numbers for a bill filter (used for the period and the one before it)
+async function analyticsSummary(match) {
+  const [s] = await SaloonWorkEntry.aggregate([
+    { $match: match },
+    { $group: {
+      _id: null,
+      revenue: { $sum: '$grandTotal' }, bills: { $sum: 1 },
+      commission: { $sum: '$staffEarning' }, discounts: { $sum: '$discountTotal' },
+      collected: { $sum: '$amountPaid' }, due: { $sum: '$amountDue' },
+      customers: { $addToSet: '$customer' }
+    } }
+  ]);
+  if (!s) return { revenue: 0, bills: 0, avgBill: 0, commission: 0, net: 0, discounts: 0, collected: 0, due: 0, customers: 0 };
+  return {
+    revenue: s.revenue, bills: s.bills, avgBill: Math.round(s.revenue / s.bills),
+    commission: s.commission, net: s.revenue - s.commission, discounts: s.discounts,
+    collected: s.collected, due: s.due, customers: s.customers.filter(Boolean).length
+  };
+}
+
+// Revenue trend buckets: hourly for one day, daily up to ~2 months, monthly beyond
+function trendBuckets(from, to, tz) {
+  const DAY = 86400000;
+  const span = to - from;
+  const fmtParts = d => new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+  if (span <= DAY) return { unit: 'hour', format: '%H', keys: Array.from({ length: 24 }, (_, h) => String(h).padStart(2, '0')) };
+  if (span <= 62 * DAY) {
+    const keys = [];
+    for (let t = from.getTime(); t <= to.getTime(); t += DAY) keys.push(fmtParts(new Date(t)));
+    return { unit: 'day', format: '%Y-%m-%d', keys: [...new Set(keys)] };
+  }
+  const keys = [];
+  const [y0, m0] = fmtParts(from).split('-').map(Number), [y1, m1] = fmtParts(to).split('-').map(Number);
+  for (let y = y0, m = m0; y < y1 || (y === y1 && m <= m1); m === 12 ? (y++, m = 1) : m++) keys.push(`${y}-${String(m).padStart(2, '0')}`);
+  return { unit: 'month', format: '%Y-%m', keys };
+}
+
+// GET /api/saloon/analytics?from=YYYY-MM-DD&to=YYYY-MM-DD   (both optional; no from = all time)
+router.get('/analytics', saloonAuth, requireRole('owner'), async (req, res) => {
+  try {
+    const saloonId = req.saloon._id;
+    const tz = tzOf(req.saloon);
+    const { from: qFrom, to: qTo } = req.query;
+
+    let from = parseDay(qFrom, tz), to = parseDay(qTo, tz, true);
+    if ((qFrom && !from) || (qTo && !to)) return res.status(400).json({ message: 'Invalid date range.' });
+    if (!to) to = todayRange(tz).end;
+    if (!from) {   // all time: start at the first bill
+      const first = await SaloonWorkEntry.findOne({ saloon: saloonId }).sort({ serviceDate: 1 }).select('serviceDate').lean();
+      from = first ? parseDay(new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(first.serviceDate), tz) : todayRange(tz).start;
+    }
+    if (from > to) return res.status(400).json({ message: 'Start date is after end date.' });
+
+    const match = { saloon: saloonId, serviceDate: { $gte: from, $lte: to } };
+    // The same length of time immediately before, for ▲/▼ comparisons (not for all time)
+    const prevMatch = qFrom
+      ? { saloon: saloonId, serviceDate: { $gte: new Date(from - (to - from) - 1), $lt: from } }
+      : null;
+    const bucket = trendBuckets(from, to, tz);
+
+    const [summary, previous, [f], newCustomers, outstanding] = await Promise.all([
+      analyticsSummary(match),
+      prevMatch ? analyticsSummary(prevMatch) : null,
+      SaloonWorkEntry.aggregate([
+        { $match: match },
+        { $facet: {
+          trend: [
+            { $group: { _id: { $dateToString: { format: bucket.format, date: '$serviceDate', timezone: tz } }, revenue: { $sum: '$grandTotal' }, bills: { $sum: 1 } } }
+          ],
+          heat: [
+            { $group: { _id: { dow: { $dayOfWeek: { date: '$serviceDate', timezone: tz } }, hour: { $hour: { date: '$serviceDate', timezone: tz } } }, bills: { $sum: 1 }, revenue: { $sum: '$grandTotal' } } }
+          ],
+          services: [
+            { $unwind: '$services' },
+            { $group: { _id: '$services.serviceName', qty: { $sum: { $ifNull: ['$services.qty', 1] } },
+              revenue: { $sum: { $subtract: [{ $multiply: ['$services.price', { $ifNull: ['$services.qty', 1] }] }, { $ifNull: ['$services.discount', 0] }] } } } },
+            { $sort: { revenue: -1 } }, { $limit: 8 }
+          ],
+          categories: [
+            { $unwind: '$services' },
+            { $group: { _id: { $ifNull: ['$services.category', 'other'] },
+              revenue: { $sum: { $subtract: [{ $multiply: ['$services.price', { $ifNull: ['$services.qty', 1] }] }, { $ifNull: ['$services.discount', 0] }] } } } },
+            { $sort: { revenue: -1 } }
+          ],
+          staff: [
+            { $group: { _id: '$staff', name: { $first: '$staffName' }, bills: { $sum: 1 }, revenue: { $sum: '$grandTotal' }, commission: { $sum: '$staffEarning' } } },
+            { $sort: { revenue: -1 } }
+          ],
+          payment: [
+            { $group: { _id: '$paymentMode', collected: { $sum: '$amountPaid' }, bills: { $sum: 1 } } }
+          ],
+          topCustomers: [
+            { $match: { customer: { $ne: null } } },
+            { $group: { _id: '$customer', spent: { $sum: '$grandTotal' }, visits: { $sum: 1 }, last: { $max: '$serviceDate' } } },
+            { $sort: { spent: -1 } }, { $limit: 5 },
+            { $lookup: { from: 'salooncustomers', localField: '_id', foreignField: '_id', as: 'c' } },
+            { $project: { spent: 1, visits: 1, last: 1, name: { $first: '$c.name' }, phone: { $first: '$c.phone' } } }
+          ],
+          walkIns: [{ $match: { customer: null } }, { $count: 'n' }]
+        } }
+      ]),
+      // New = their first bill ever falls in this period (works for backdated bills too)
+      SaloonWorkEntry.aggregate([
+        { $match: { saloon: saloonId, customer: { $ne: null }, serviceDate: { $lte: to } } },
+        { $group: { _id: '$customer', first: { $min: '$serviceDate' } } },
+        { $match: { first: { $gte: from } } },
+        { $count: 'n' }
+      ]).then(r => r[0]?.n || 0),
+      SaloonWorkEntry.aggregate([
+        { $match: { saloon: saloonId, paymentStatus: { $in: ['pending', 'partial'] }, amountDue: { $gt: 0 } } },
+        { $group: { _id: null, total: { $sum: '$amountDue' }, customers: { $addToSet: '$customer' } } }
+      ])
+    ]);
+
+    const byKey = Object.fromEntries(f.trend.map(t => [t._id, t]));
+    const newC = Math.min(newCustomers, summary.customers);
+
+    res.json({
+      period: { from, to, unit: bucket.unit, timezone: tz },
+      summary, previous,
+      trend: bucket.keys.map(k => ({ key: k, revenue: byKey[k]?.revenue || 0, bills: byKey[k]?.bills || 0 })),
+      heat: f.heat.map(h => ({ dow: h._id.dow, hour: h._id.hour, bills: h.bills, revenue: h.revenue })),   // dow: 1 = Sunday
+      services: f.services.map(s => ({ name: s._id, qty: s.qty, revenue: s.revenue })),
+      categories: f.categories.map(c => ({ category: c._id, revenue: c.revenue })),
+      staff: f.staff.map(s => ({ name: s.name, bills: s.bills, revenue: s.revenue, commission: s.commission })),
+      payment: { modes: f.payment.map(p => ({ mode: p._id, collected: p.collected, bills: p.bills })), unpaid: summary.due },
+      customers: {
+        served: summary.customers, new: newC, returning: Math.max(0, summary.customers - newC),
+        walkIns: f.walkIns[0]?.n || 0, top: f.topCustomers
+      },
+      outstanding: { total: outstanding[0]?.total || 0, customers: (outstanding[0]?.customers || []).filter(Boolean).length }
+    });
   } catch (err) { sendError(res, err); }
 });
 
